@@ -117,9 +117,9 @@ void dfsan_init_qemu(void);
 
 void dfsan_unimplemented(char *fname);
 
-dfsan_label __taint_trace_cmp(dfsan_label l1, dfsan_label l2, u8 size, u32 predicate,
+dfsan_label __taint_trace_cmp(dfsan_label l1, dfsan_label l2, u8 size, u64 result, u32 predicate,
                        u64 op1, u64 op2, u32 cid);
-
+void __debug_expr(dfsan_label label);
 void addContextRecording(u64 func_addr);
 
 /// Interceptor hooks.

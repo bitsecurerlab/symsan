@@ -199,6 +199,7 @@ enum pipe_msg_type {
   gep_type = 1,
   memcmp_type = 2,
   fsize_type = 3,
+  debug_type = 4,
 };
 
 #define F_ADD_CONS  0x1

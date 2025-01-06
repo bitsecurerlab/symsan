@@ -78,12 +78,11 @@ struct labeltuple_hash {
 typedef std::unordered_set<std::tuple<uint32_t, uint32_t>, labeltuple_hash> labeltuple_set_t;
 
 typedef struct {
-  expr_set_t expr_deps;
-  // labeltuple_set_t label_tuples;
+  // expr_set_t expr_deps;
+  labeltuple_set_t label_tuples;
   std::unordered_set<dfsan_label> input_deps;
 } branch_dep_t;
 static std::vector<branch_dep_t*> __branch_deps;
-labeltuple_set_t added_label;
 
 AflTraceMap *_trace;
 
@@ -136,20 +135,9 @@ static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, u32 predicate)
   Die();
 }
 
-// static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, std::unordered_set<u32> &deps) {
-//   expr_cache.insert({label,e});
-//   deps_cache.insert({label,deps});
-//   return e;
-// }
-
 static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, std::unordered_set<u32> &deps) {
   expr_cache.insert({label,e});
   deps_cache.insert({label,deps});
-  return e;
-}
-
-static inline z3::expr cache_expr_only(dfsan_label label, z3::expr const &e) {
-  expr_cache.insert({label,e});
   return e;
 }
 
@@ -372,220 +360,6 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   Die();
 }
 
-static z3::expr serialize_simple(dfsan_label label) {
-  if (label < CONST_OFFSET || label == kInitializingLabel) {
-    AOUT("WARNING: invalid label: %d\n", label);
-    throw z3::exception("invalid label");
-  }
-
-  dfsan_label_info *info = get_label_info(label);
-  // if (print_debug) {
-  //   AOUT("%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%llu, op2:%llu)\n",
-  //         label, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
-  // }
-
-  auto expr_itr = expr_cache.find(label);
-  if (expr_itr != expr_cache.end()) {
-    auto deps_itr = deps_cache.find(label);
-    return expr_itr->second;
-  }
-
-  // special ops
-  if (info->op == 0) {
-    // input
-    z3::symbol symbol = __z3_context.int_symbol(info->op1.i);
-    z3::sort sort = __z3_context.bv_sort(8);
-    tsize_cache[label] = 1; // lazy init
-    // fprintf(stderr, "input offset 0x%lx\n", info->op1.i);
-    // caching is not super helpful
-    return __z3_context.constant(symbol, sort);
-  } else if (info->op == Load) {
-    u64 offset = get_label_info(info->l1)->op1.i;
-    z3::symbol symbol = __z3_context.int_symbol(offset);
-    z3::sort sort = __z3_context.bv_sort(8);
-    z3::expr out = __z3_context.constant(symbol, sort);
-    for (u32 i = 1; i < info->l2; i++) {
-      // fprintf(stderr, "offset + i 0x%lx\n", offset+i);
-      symbol = __z3_context.int_symbol(offset + i);
-      out = z3::concat(__z3_context.constant(symbol, sort), out);
-    }
-    tsize_cache[label] = 1; // lazy init
-    return cache_expr_only(label, out);
-  } else if (info->op == ZExt) {
-    // Z3_mk_zero_ext(g_context, bits, expr)
-    z3::expr base = serialize_simple(info->l1);
-    tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr_only(label, z3::zext(base, info->op2.i));
-  } else if (info->op == SExt) {
-    z3::expr base = serialize_simple(info->l1);
-    tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr_only(label, z3::sext(base, info->op2.i));
-  } else if (info->op == Trunc) {
-    z3::expr base = serialize_simple(info->l1);
-    tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr_only(label, base.extract(info->op2.i - 1, 0));
-  } else if (info->op == Extract) {
-    z3::expr base = serialize_simple(info->l1);
-    assert(base.get_sort().bv_size() > info->op2.i);
-    assert(base.get_sort().bv_size() > info->op1.i);
-    tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    // Z3_mk_extract(g_context, first_bit, last_bit, expr)
-    return cache_expr_only(label, base.extract(info->op1.i, info->op2.i));
-  } else if (info->op == Not) {
-    if (info->l2 == 0/* || info->size != 1*/) {
-      throw z3::exception("invalid Not operation");
-    }
-    z3::expr e = serialize_simple(info->l2);
-    tsize_cache[label] = tsize_cache[info->l2]; // lazy init
-    if (!e.is_bool()) {
-      // bvnot
-      return cache_expr_only(label, ~e);
-    } else {
-      throw z3::exception("Only LNot should be recorded");
-      // return cache_expr(label, !e, deps);
-    }
-  } else if (info->op == Neg) {
-    if (info->l2 == 0) {
-      throw z3::exception("invalid Neg predicate");
-    }
-    z3::expr e = serialize_simple(info->l2);
-    tsize_cache[label] = tsize_cache[info->l2]; // lazy init
-    return cache_expr_only(label, -e);
-  }
-  // higher-order
-  else if (info->op == fmemcmp) {
-    z3::expr op1 = (info->l1 >= CONST_OFFSET) ? serialize_simple(info->l1) :
-                   read_concrete(label, info->size); // memcmp size in bytes
-    if (info->l2 < CONST_OFFSET) {
-      throw z3::exception("invalid memcmp operand2");
-    }
-    z3::expr op2 = serialize_simple(info->l2);
-    tsize_cache[label] = 1; // lazy init
-    z3::expr e = z3::ite(op1 == op2, __z3_context.bv_val(0, 32),
-                                     __z3_context.bv_val(1, 32));
-    return cache_expr_only(label, e);
-  } else if (info->op == fsize) {
-    // file size
-    z3::symbol symbol = __z3_context.str_symbol("fsize");
-    z3::sort sort = __z3_context.bv_sort(info->size);
-    z3::expr base = __z3_context.constant(symbol, sort);
-    tsize_cache[label] = 1; // lazy init
-    // don't cache because of deps
-    if (info->op1.i) {
-      // minus the offset stored in op1
-      z3::expr offset = __z3_context.bv_val((uint64_t)info->op1.i, info->size);
-      return base - offset;
-    } else {
-      return base;
-    }
-  } else if (info->op == Ite) {
-    // Covert bool expression to bv.
-    z3::expr op1 = serialize_simple(info->l1);
-    if (op1.is_bool()) {
-      z3::expr e = z3::ite(op1, __z3_context.bv_val(1, 1),
-                                     __z3_context.bv_val(0, 1));
-      assert(info->size > 1);
-      e = z3::zext(e, info->size - 1);
-      tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-      return cache_expr_only(label, e);
-    } else {
-      throw z3::exception("invalid Ite operation(for bool expr only)");
-    }
-  } else if (info->op == Equal) {
-    // try an alternative symbolic address.
-    // build an equal expression for a symbolic address.
-    z3::expr e = serialize_simple(info->l1) == \
-                 __z3_context.bv_val((uint64_t)info->op1.i, info->size);
-    tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr_only(label, e);
-  }
-
-  // common ops
-  u8 size = info->size;
-  if (info->l1 == 0) {
-    if (info->op == Concat) {
-      // size = 8;
-      size = info->size - get_label_info(info->l2)->size;
-    } else {
-      size = get_label_info(info->l2)->size;
-    }
-  }
-
-  z3::expr op1 = __z3_context.bv_val((uint64_t)info->op1.i, size);
-  if (info->l1 >= CONST_OFFSET) {
-    op1 = serialize_simple(info->l1).simplify();
-  }
-
-  if (info->l2 == 0) {
-    if (info->op == Concat) {
-      // size = 8;
-      size = info->size - get_label_info(info->l1)->size;
-    } else {
-      size = get_label_info(info->l1)->size;
-    }
-  }
-
-  z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
-  if (info->l2 >= CONST_OFFSET) {
-    std::unordered_set<u32> deps2;
-    op2 = serialize_simple(info->l2).simplify();
-  }
-  // AOUT("op %ld: op1 sort size = %d, op2 sort size = %d\n", info->op, op1.get_sort().bv_size(), op2.get_sort().bv_size());
-
-  // size for concat is a bit complicated ...
-  // if (info->op == Concat && info->l1 == 0) {
-  //   assert(info->l2 >= CONST_OFFSET);
-  //   size = info->size - get_label_info(info->l2)->size;
-  // }
-  // z3::expr op1 = __z3_context.bv_val((uint64_t)info->op1.i, size);
-  // if (info->l1 >= CONST_OFFSET) {
-  //   op1 = serialize(info->l1, deps).simplify();
-  // } else if (info->size == 1) {
-  //   op1 = __z3_context.bool_val(info->op1.i == 1);
-  // }
-  // if (info->op == Concat && info->l2 == 0) {
-  //   assert(info->l1 >= CONST_OFFSET);
-  //   size = info->size - get_label_info(info->l1)->size;
-  // }
-  // z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
-  // if (info->l2 >= CONST_OFFSET) {
-  //   std::unordered_set<u32> deps2;
-  //   op2 = serialize(info->l2, deps2).simplify();
-  //   deps.insert(deps2.begin(),deps2.end());
-  // } else if (info->size == 1) {
-  //   op2 = __z3_context.bool_val(info->op2.i == 1);
-  // }
-  // update tree_size
-  tsize_cache[label] = tsize_cache[info->l1] + tsize_cache[info->l2];
-
-  switch((info->op & 0xff)) {
-    // llvm doesn't distinguish between logical and bitwise and/or/xor
-    case And:     return cache_expr_only(label, info->size != 1 ? (op1 & op2) : (op1 && op2));
-    case Or:      return cache_expr_only(label, info->size != 1 ? (op1 | op2) : (op1 || op2));
-    case Xor:     return cache_expr_only(label, op1 ^ op2);
-    case Shl:     return cache_expr_only(label, z3::shl(op1, op2));
-    case LShr:    return cache_expr_only(label, z3::lshr(op1, op2));
-    case AShr:    return cache_expr_only(label, z3::ashr(op1, op2));
-    case Add:     return cache_expr_only(label, op1 + op2);
-    case Sub:     return cache_expr_only(label, op1 - op2);
-    case Mul:     return cache_expr_only(label, op1 * op2);
-    case UDiv:    return cache_expr_only(label, z3::udiv(op1, op2));
-    case SDiv:    return cache_expr_only(label, op1 / op2);
-    case URem:    return cache_expr_only(label, z3::urem(op1, op2));
-    case SRem:    return cache_expr_only(label, z3::srem(op1, op2));
-    // relational
-    case ICmp:    return cache_expr_only(label, get_cmd(op1, op2, info->op >> 8));
-    // concat
-    case Concat:  return cache_expr_only(label, z3::concat(op2, op1)); // little endian
-    default:
-      AOUT("FATAL: unsupported op: %u\n", info->op);
-      throw z3::exception("unsupported operator");
-      break;
-  }
-  // should never reach here
-  Die();
-}
-
 static inline void cache_expr_deps(dfsan_label label, std::unordered_set<u32> &deps) {
   deps_cache.insert({label, deps});
 }
@@ -648,41 +422,41 @@ static void _get_input_deps(dfsan_label label, std::unordered_set<u32> &deps) {
   return;
 }
 
-// static void collect_input_deps(dfsan_label label, u8 r, bool add_nested, uint64_t addr) {
-//   std::unordered_set<dfsan_label> inputs;
-//   _get_input_deps(label, inputs);
+static void collect_input_deps(dfsan_label label, u8 r, bool add_nested, uint64_t addr) {
+  std::unordered_set<dfsan_label> inputs;
+  _get_input_deps(label, inputs);
 
-//   std::vector<dfsan_label> worklist;
-//   worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
-//   while (!worklist.empty()) {
-//     auto off = worklist.back();
-//     worklist.pop_back();
+  std::vector<dfsan_label> worklist;
+  worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
+  while (!worklist.empty()) {
+    auto off = worklist.back();
+    worklist.pop_back();
 
-//     auto deps = get_branch_dep(off);
-//     if (deps != nullptr) {
-//       for (auto i : deps->input_deps) {
-//         if (inputs.insert(i).second)
-//           worklist.push_back(i);
-//       }
-//     }
-//   }
+    auto deps = get_branch_dep(off);
+    if (deps != nullptr) {
+      for (auto i : deps->input_deps) {
+        if (inputs.insert(i).second)
+          worklist.push_back(i);
+      }
+    }
+  }
 
-//   for (auto off : inputs) {
-//     auto c = get_branch_dep(off);
-//     if (c == nullptr) {
-//       c = new branch_dep_t();
-//       // fprintf(stderr, "new branch dep at offset 0x%lx\n", off);
-//       set_branch_dep(off, c);
-//     }
-//     if (c == nullptr) {
-//       AOUT("WARNING: out of memory\n");
-//     } else {
-//       c->input_deps.insert(inputs.begin(), inputs.end());
-//       c->label_tuples.insert(std::make_tuple(label, r));
-//     }
-//   }
+  for (auto off : inputs) {
+    auto c = get_branch_dep(off);
+    if (c == nullptr) {
+      c = new branch_dep_t();
+      fprintf(stderr, "new branch dep at offset 0x%lx\n", off);
+      set_branch_dep(off, c);
+    }
+    if (c == nullptr) {
+      AOUT("WARNING: out of memory\n");
+    } else {
+      c->input_deps.insert(inputs.begin(), inputs.end());
+      c->label_tuples.insert(std::make_tuple(label, r));
+    }
+  }
 
-// }
+}
 
 static void generate_input(z3::model &m) {
   char path[PATH_MAX];
@@ -767,100 +541,22 @@ static bool __solve_expr(z3::expr &e) {
   return ret;
 }
 
-static void __solve_cond(dfsan_label label, u8 r, bool add_nested, u64 addr) {
+static void __solve_cond_print(dfsan_label label, u8 r, bool add_nested, uint64_t addr) {
 
   z3::expr result = __z3_context.bool_val(r != 0);
 
   bool pushed = false;
   try {
+    // if (addr == 0x40008da8c7) print_debug = true;
+    // else print_debug = false;
     std::unordered_set<dfsan_label> inputs;
     z3::expr cond = serialize(label, inputs).simplify();
 
-    // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-    // AOUT("sym branch: 0x%lx constraint: %s\n", addr, cond.to_string().c_str());
-    // return;
-    // collect additional input deps
-    std::vector<dfsan_label> worklist;
-    worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
-    while (!worklist.empty()) {
-      auto off = worklist.back();
-      worklist.pop_back();
+    // __z3_solver.add(cond);
+    // if (sym_count++ < 1000){
+      // fprintf(stderr, "interesting branch: 0x%lx\n", addr & 0xfff);
 
-      auto deps = get_branch_dep(off);
-      if (deps != nullptr) {
-        for (auto i : deps->input_deps) {
-          if (inputs.insert(i).second)
-            worklist.push_back(i);
-        }
-      }
-    }
-
-    __z3_solver.reset();
-    __z3_solver.set("timeout", 5000U);
-    // 2. add constraints
-    expr_set_t added;
-    for (auto off : inputs) {
-      // AOUT("adding offset 0x%lx\n", off);
-      auto deps = get_branch_dep(off);
-      if (deps != nullptr) {
-        for (auto &expr : deps->expr_deps) {
-          if (added.insert(expr).second) {
-            //AOUT("adding expr: %s\n", expr.to_string().c_str());
-            __z3_solver.add(expr);
-          }
-        }
-      }
-    }
-    // fprintf(stderr, "%s\n", __z3_solver.to_smt2().c_str());
-    // fprintf(stderr, "%s\n", cond.to_string().c_str());
-    // return;
-    // assert(__z3_solver.check() == z3::sat);
-    // fprintf(stderr, "\n%s\n", __z3_solver.to_smt2().c_str());
-      // fprintf(stderr, "interesting branch 0x%lx\n", addr & 0xfff);
-    // z3::expr e = cond;
-    // if (r) {
-    //   e = !cond;
     // }
-    z3::expr e = (cond != result);
-
-    if (__solve_expr(e)) {
-      // AOUT("branch solved\n");
-    } else {
-      // AOUT("branch not solvable @%p\n", addr);
-      //AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
-      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
-    }
-
-    if (add_nested) {
-      for (auto off : inputs) {
-        auto c = get_branch_dep(off);
-        if (c == nullptr) {
-          c = new branch_dep_t();
-          set_branch_dep(off, c);
-        }
-        if (c == nullptr) {
-          AOUT("WARNING: out of memory\n");
-        } else {
-          c->input_deps.insert(inputs.begin(), inputs.end());
-          c->expr_deps.insert(cond == result);
-        }
-      }
-    }
-
-  } catch (z3::exception e) {
-    AOUT("WARNING: solving error: %s @ label %d\n", e.msg(), label);
-  }
-
-}
-#if 0
-static void __solve_last_cond(dfsan_label label, u8 r, std::unordered_set<dfsan_label> &inputs) {
-
-  // z3::expr result = __z3_context.bool_val(r != 0);
-
-  bool pushed = false;
-  try {
-    // std::unordered_set<dfsan_label> inputs;
-    z3::expr cond = serialize(label, inputs).simplify();
 
     // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
     // AOUT("sym branch: 0x%lx constraint: %s\n", addr, cond.to_string().c_str());
@@ -882,25 +578,117 @@ static void __solve_last_cond(dfsan_label label, u8 r, std::unordered_set<dfsan_
     }
     
     // fprintf(stderr, "branch: 0x%lx \n", addr);
+    
+    __z3_solver.reset();
+    __z3_solver.set("timeout", 5000U);
     // 2. add constraints
-    dfsan_label dep_label = 0;
-    u8 dep_r = 0;
+    expr_set_t added;
+    for (auto off : inputs) {
+      AOUT("adding offset 0x%lx\n", off);
+      auto deps = get_branch_dep(off);
+      if (deps != nullptr) {
+        for (auto &expr : deps->expr_deps) {
+          if (added.insert(expr).second) {
+            AOUT("offset %d sync expr: %s\n", off, expr.to_string().c_str());
+            __z3_solver.add(expr);
+          }
+        }
+      }
+    }
+    fprintf(stderr, "%s\n", __z3_solver.to_smt2().c_str());
+    fprintf(stderr, "%s\n", cond.to_string().c_str());
+    // return;
+    // assert(__z3_solver.check() == z3::sat);
+    // fprintf(stderr, "\n%s\n", __z3_solver.to_smt2().c_str());
+      // fprintf(stderr, "interesting branch 0x%lx\n", addr & 0xfff);
+    z3::expr e = cond;
+    if (r) {
+      e = !cond;
+    }
+    // z3::expr e = (cond != result);
+    if (__solve_expr(e)) {
+    //  AOUT("branch solved\n");
+      // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+    } else {
+    //  AOUT("branch not solvable @ 0x%lx\n", addr);
+      // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
+    }
+
+    // nested branch
+    // always add nested branch deps
+    // if (add_nested) {
+      for (auto off : inputs) {
+        auto c = get_branch_dep(off);
+        if (c == nullptr) {
+          c = new branch_dep_t();
+          set_branch_dep(off, c);
+        }
+        if (c == nullptr) {
+          AOUT("WARNING: out of memory\n");
+        } else {
+          c->input_deps.insert(inputs.begin(), inputs.end());
+          c->expr_deps.insert(cond == result);
+        }
+      }
+    // }
+
+  } catch (z3::exception e) {
+    AOUT("WARNING: solving error: %s @ 0x%lx label %d\n", e.msg(), addr, label);
+  }
+
+}
+
+static void __solve_cond(dfsan_label label, u8 r, bool add_nested, uint64_t addr) {
+
+  z3::expr result = __z3_context.bool_val(r != 0);
+
+  bool pushed = false;
+  try {
+    // if (addr == 0x40008da8c7) print_debug = true;
+    // else print_debug = false;
+    std::unordered_set<dfsan_label> inputs;
+    z3::expr cond = serialize(label, inputs).simplify();
+
+    // __z3_solver.add(cond);
+    // if (sym_count++ < 1000){
+      // fprintf(stderr, "interesting branch: 0x%lx\n", addr & 0xfff);
+
+    // }
+
+    // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+    // AOUT("sym branch: 0x%lx constraint: %s\n", addr, cond.to_string().c_str());
+    // return;
+    // collect additional input deps
+    std::vector<dfsan_label> worklist;
+    worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
+    while (!worklist.empty()) {
+      auto off = worklist.back();
+      worklist.pop_back();
+
+      auto deps = get_branch_dep(off);
+      if (deps != nullptr) {
+        for (auto i : deps->input_deps) {
+          if (inputs.insert(i).second)
+            worklist.push_back(i);
+        }
+      }
+    }
+    
+    // fprintf(stderr, "branch: 0x%lx \n", addr);
+    
+    __z3_solver.reset();
+    __z3_solver.set("timeout", 5000U);
+    // 2. add constraints
+    expr_set_t added;
     for (auto off : inputs) {
       // AOUT("adding offset 0x%lx\n", off);
       auto deps = get_branch_dep(off);
       if (deps != nullptr) {
-        for (auto &expr : deps->label_tuples) {
-          if (added_label.insert(expr).second) {
-            dep_label = std::get<0>(expr);
-            dep_r = std::get<1>(expr);
-            // fprintf(stderr, "unfloding label tuple %d %d offset %d\n", dep_label, dep_r, off);
-            z3::expr dep_cond = serialize_simple(dep_label).simplify();
-            if (dep_r) {
-              dep_cond = !dep_cond;
-            }
-            // fprintf(stderr, "dep_cond: %s\n", dep_cond.to_string().c_str());
-            __z3_solver.add(dep_cond);
-            // __solve_last_cond(std::get<0>(expr), std::get<1>(expr));
+        for (auto &expr : deps->expr_deps) {
+          if (added.insert(expr).second) {
+            // AOUT("sync expr: %s\n", expr.to_string().c_str());
+            __z3_solver.add(expr);
           }
         }
       }
@@ -915,29 +703,40 @@ static void __solve_last_cond(dfsan_label label, u8 r, std::unordered_set<dfsan_
     if (r) {
       e = !cond;
     }
-    __z3_solver.add(e);
     // z3::expr e = (cond != result);
+    if (__solve_expr(e)) {
+    //  AOUT("branch solved\n");
+      // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+    } else {
+    //  AOUT("branch not solvable @ 0x%lx\n", addr);
+      // AOUT("\n%s\n", __z3_solver.to_smt2().c_str());
+      //AOUT("  tree_size = %d", __dfsan_label_info[label].tree_size);
+    }
+
+    // nested branch
+    // always add nested branch deps
+    // if (add_nested) {
+      for (auto off : inputs) {
+        auto c = get_branch_dep(off);
+        if (c == nullptr) {
+          c = new branch_dep_t();
+          set_branch_dep(off, c);
+        }
+        if (c == nullptr) {
+          AOUT("WARNING: out of memory\n");
+        } else {
+          c->input_deps.insert(inputs.begin(), inputs.end());
+          c->expr_deps.insert(cond == result);
+        }
+      }
+    // }
 
   } catch (z3::exception e) {
-    AOUT("WARNING: solving error: %s @ label %d\n", e.msg(), label);
+    AOUT("WARNING: solving error: %s @ 0x%lx label %d\n", e.msg(), addr, label);
   }
 
 }
 
-static void solve_last_cond(dfsan_label label, u8 r, bool add_nested, uint64_t addr) {
-  added_label.clear();
-  __z3_solver.reset();
-  __z3_solver.set("timeout", 5000U);
-  // fprintf(stderr, "solving label: 0x%d", label);
-  // recursively add all constraints from dependencies
-  std::unordered_set<dfsan_label> inputs;
-  __solve_last_cond(label, r, inputs);
-  for (auto off : inputs) {
-    fprintf(stderr, "offset 0x%x\n", off);
-  }
-  // fprintf(stderr, "%s\n", __z3_solver.to_smt2().c_str());
-}
-#endif
 // assumes under try-catch and the global solver already has context
 static void __solve_gep(z3::expr &index, uint64_t lb, uint64_t ub, uint64_t step, void *addr) {
 
@@ -1008,11 +807,11 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
     for (auto off : inputs) {
       auto deps = get_branch_dep(off);
       if (deps != nullptr) {
-        // for (auto &expr : deps->expr_deps) {
-        //   if (added.insert(expr).second) {
-        //     __z3_solver.add(expr);
-        //   }
-        // }
+        for (auto &expr : deps->expr_deps) {
+          if (added.insert(expr).second) {
+            __z3_solver.add(expr);
+          }
+        }
       }
     }
     assert(__z3_solver.check() == z3::sat);
@@ -1061,7 +860,7 @@ static void __handle_gep(dfsan_label ptr_label, uptr ptr,
         AOUT("WARNING: out of memory\n");
       } else {
         c->input_deps.insert(inputs.begin(), inputs.end());
-        // c->expr_deps.insert(i == r);
+        c->expr_deps.insert(i == r);
       }
     }
 
@@ -1169,27 +968,25 @@ int main(int argc, char* const argv[]) {
   memcmp_msg *mmsg = nullptr;
 
   std::vector<std::pair<uint32_t, uint64_t>> branch_label;
-  // size_t branch_size = 0;
-  // dfsan_label last_label = 0;
-  // uint64_t last_pc = 0;
+  size_t branch_size = 0;
+  dfsan_label last_label = 0;
+  uint64_t last_pc = 0;
 
   while (read(pipefds[0], &msg, sizeof(msg)) > 0) {
     // solve constraints
     switch (msg.msg_type) {
       case cond_type:
         // info = get_label_info(msg.label);
-        // last_label = msg.label;
-        // last_pc = msg.id;
+        branch_label.push_back({msg.id, msg.label});
+        branch_size++;
+        last_label = msg.label;
+        last_pc = msg.id;
         // fprintf(stderr, "sym branch: 0x%lx %s\n", msg.id, msg.result? "taken":"not taken");
-        if (_trace->isInterestingBranch(msg.id, msg.result)) {
-          // branch_label.push_back({msg.id, msg.label});
-          // branch_size++;
+        // if (_trace->isInterestingBranch(msg.id, msg.result)) {
           // AOUT("interesting branch: 0x%lx, %s\n", msg.id, msg.result? "taken":"not taken");
-          __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
-          
-          // collect_input_deps(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
-        
-        }
+          // __solve_cond(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
+        collect_input_deps(msg.label, msg.result, msg.flags & F_ADD_CONS, msg.id);
+        // }
         break;
       case gep_type:
         if (read(pipefds[0], &gmsg, sizeof(gmsg)) != sizeof(gmsg)) {
@@ -1235,15 +1032,15 @@ int main(int argc, char* const argv[]) {
   waitpid(pid, &status, 0);
   if (WIFSIGNALED(status)) {
     // fprintf(stderr, "Child terminated by signal: %d\n", WTERMSIG(status));
-    // int i = 0;
-    // for (auto &b : branch_label) {
-      // i++;
-      // if (branch_size - i > 21) continue;
-      // fprintf(stderr, "pc 0x%x\n", b.first);
+    int i = 0;
+    for (auto &b : branch_label) {
+      i++;
+      if (branch_size - i > 10) continue;
+      // fprintf(stderr, "0x%x\n", b.first);
       // fprintf(stderr, "0x%x\n", b.second);
       // __solve_cond_print(b.second, 0, 1, b.first);
-    // }
-    // solve_last_cond(last_label, 0, 1, last_pc);
+    }
+    __solve_cond_print(last_label, 0, 1, last_pc);
   }
   // wait(NULL);
   exit(0);
