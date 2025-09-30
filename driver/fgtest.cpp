@@ -735,7 +735,6 @@ int sym_count = 0;
 // assumes under try-catch and the global solver __z3_solver already has nested context
 static bool __solve_expr(z3::expr &e) {
   bool ret = false;
-  return false; // disable solving
   // set up local optmistic solver
   z3::solver opt_solver = z3::solver(__z3_context, "QF_BV");
   opt_solver.set("timeout", 1000U); // follow timeout of symcc
@@ -1089,6 +1088,9 @@ int main(int argc, char* const argv[]) {
 
   // load input file from symcc env.
   char *input = getenv("SYMCC_INPUT_FILE");
+  if (input == NULL) {
+      fprintf(stderr, "ERROR: Cannot read SYMCC_INPUT_FILE environment variable! Exiting...\n");
+  }
   if (strcmp(input, "stdin") != 0) {
   struct stat st;
   int fd = open(input, O_RDONLY);
