@@ -1090,6 +1090,7 @@ int main(int argc, char* const argv[]) {
   char *input = getenv("SYMCC_INPUT_FILE");
   if (input == NULL) {
       fprintf(stderr, "ERROR: Cannot read SYMCC_INPUT_FILE environment variable! Exiting...\n");
+      exit(1);
   }
   if (strcmp(input, "stdin") != 0) {
   struct stat st;
