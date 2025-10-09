@@ -1248,6 +1248,10 @@ int main(int argc, char* const argv[]) {
     // }
     // solve_last_cond(last_label, 0, 1, last_pc);
   }
-  // wait(NULL);
+
+  // Clean up shared memory to prevent resource leaks
+  shmdt(__dfsan_label_info);    // Detach from shared memory
+  shmctl(shmid, IPC_RMID, NULL); // Mark shared memory segment for deletion
+
   exit(0);
 }
