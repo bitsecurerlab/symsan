@@ -15,6 +15,12 @@
 #include "sanitizer_common/sanitizer_internal_defs.h"
 #include "sanitizer_common/sanitizer_linux.h"
 
+#if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34)
+#define __fxstat(vers, fd, buf) fstat(fd, buf)
+#define __lxstat(vers, path, buf) lstat(path, buf)
+#define __xstat(vers, path, buf) stat(path, buf)
+#endif
+
 #include "dfsan.h"
 
 #include <arpa/inet.h>
