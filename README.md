@@ -43,6 +43,15 @@ docker build -t symsan .
 docker run  --rm --ulimit core=0 symsan bash -c 'cd /workdir/symsan && ./check.sh 2>/dev/null'
 ```
 
+To produce a reusable `install/` tree (binaries, libs, headers) for downstream
+projects:
+
+```shell
+./scripts/export_install_from_docker.sh
+```
+
+Set `SYMSAN_DOCKER_IMAGE` to override the default image tag (`symsan-build:local`).
+
 ### LIBCXX
 
 The repo contains instrumented libc++ and libc++abi to support C++ programs.
