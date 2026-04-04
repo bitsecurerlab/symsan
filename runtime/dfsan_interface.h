@@ -121,6 +121,10 @@ void dfsan_unimplemented(char *fname);
 dfsan_label __taint_trace_cmp(dfsan_label l1, dfsan_label l2, u8 size, u32 predicate,
                        u64 op1, u64 op2, u32 cid);
 
+int dfsan_is_branch_condition_label(dfsan_label label);
+size_t dfsan_get_nested_constraint_count(dfsan_label label);
+size_t dfsan_get_nested_constraints(dfsan_label label, dfsan_label *out, size_t capacity);
+
 void addContextRecording(u64 func_addr);
 
 /// Interceptor hooks.

@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <algorithm>
 
 #define OPTIMISTIC 1
 
@@ -57,6 +58,7 @@ typedef std::unordered_set<z3::expr, expr_hash, expr_equal> expr_set_t;
 typedef struct {
   expr_set_t expr_deps;
   std::unordered_set<dfsan_label> input_deps;
+  std::unordered_set<dfsan_label> cond_labels;
 } branch_dep_t;
 static std::vector<branch_dep_t*> __branch_deps;
 
@@ -72,6 +74,51 @@ static inline void set_branch_dep(size_t n, branch_dep_t* dep) {
     __branch_deps.resize(n + 1);
   }
   __branch_deps.at(n) = dep;
+}
+
+static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps);
+
+static bool collect_nested_constraint_labels(dfsan_label label,
+                                             std::vector<dfsan_label> &labels) {
+  std::unordered_set<u32> inputs;
+  std::vector<dfsan_label> ordered;
+  std::unordered_set<dfsan_label> seen;
+  std::vector<dfsan_label> worklist;
+
+  if (!dfsan_is_branch_condition_label(label)) {
+    return false;
+  }
+
+  try {
+    serialize(label, inputs);
+  } catch (z3::exception const &) {
+    return false;
+  }
+
+  worklist.insert(worklist.begin(), inputs.begin(), inputs.end());
+  while (!worklist.empty()) {
+    auto off = worklist.back();
+    worklist.pop_back();
+
+    auto deps = get_branch_dep(off);
+    if (deps == nullptr) {
+      continue;
+    }
+    for (auto input : deps->input_deps) {
+      if (inputs.insert(input).second) {
+        worklist.push_back(input);
+      }
+    }
+    for (auto cond_label : deps->cond_labels) {
+      if (cond_label != label && seen.insert(cond_label).second) {
+        ordered.push_back(cond_label);
+      }
+    }
+  }
+
+  std::sort(ordered.begin(), ordered.end());
+  labels.swap(ordered);
+  return true;
 }
 
 static z3::expr read_concrete(u64 addr, u8 size) {
@@ -432,6 +479,7 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
         } else {
           c->input_deps.insert(inputs.begin(), inputs.end());
           c->expr_deps.insert(cond == result);
+          c->cond_labels.insert(label);
         }
       }
     }
@@ -444,11 +492,11 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
 
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
 __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
                   u64 c1, u64 c2, u32 cid) {
   if ((op1 == 0 && op2 == 0))
-    return;
+    return 0;
 
   void *addr = __builtin_return_address(0);
   auto itr = __branches.find({__taint_trace_callstack, addr});
@@ -457,7 +505,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
   } else if (itr->second < MAX_BRANCH_COUNT) {
     itr->second += 1;
   } else {
-    return;
+    return 0;
   }
 
   AOUT("solving cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
@@ -469,9 +517,13 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
   z3::expr bv_c2 = __z3_context.bv_val((uint64_t)c2, size);
   z3::expr result = get_cmd(bv_c1, bv_c2, predicate).simplify();
 
-  // trace_cmp is only used in switch statement
-  // only add nested constraints for the case taken
-  __solve_cond(temp, result, c1 == c2, addr);
+  /*
+   * SymFit uses trace_cmp on path-condition labels produced by setcond.
+   * Retain the resolved condition as a nested constraint for the current path
+   * instead of approximating "taken" as a raw operand equality check.
+   */
+  __solve_cond(temp, result, true, addr);
+  return temp;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -494,6 +546,32 @@ __taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
 
   z3::expr result = __z3_context.bool_val(r);
   __solve_cond(label, result, true, addr);
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
+dfsan_get_nested_constraint_count(dfsan_label label) {
+  std::vector<dfsan_label> labels;
+
+  if (!collect_nested_constraint_labels(label, labels)) {
+    return 0;
+  }
+  return labels.size();
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
+dfsan_get_nested_constraints(dfsan_label label, dfsan_label *out, size_t capacity) {
+  std::vector<dfsan_label> labels;
+
+  if (!collect_nested_constraint_labels(label, labels)) {
+    return 0;
+  }
+  if (out != nullptr && capacity != 0) {
+    size_t n = std::min(capacity, labels.size());
+    for (size_t i = 0; i < n; ++i) {
+      out[i] = labels[i];
+    }
+  }
+  return labels.size();
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -692,4 +770,3 @@ extern "C" void InitializeSolver() {
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;
 }
-

@@ -80,6 +80,9 @@ dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
 dfsan_label dfsan_create_label(off_t offset);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
+int dfsan_is_branch_condition_label(dfsan_label label);
+uptr dfsan_get_nested_constraint_count(dfsan_label label);
+uptr dfsan_get_nested_constraints(dfsan_label label, dfsan_label *out, uptr capacity);
 
 // taint source
 void taint_set_file(const char *filename, int fd);

@@ -648,6 +648,18 @@ dfsan_label_info *dfsan_get_label_info(dfsan_label label) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_is_branch_condition_label(dfsan_label label) {
+  const dfsan_label_info *info;
+
+  if (label == CONST_LABEL) {
+    return 0;
+  }
+  dfsan_check_label(label);
+  info = &__dfsan_label_info[label];
+  return (info->op & 0xff) == ICmp;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
 dfsan_has_label(dfsan_label label, dfsan_label elem) {
   if (label == elem)
     return true;
@@ -1027,7 +1039,7 @@ static u32 __instance_id;
 static u32 __session_id;
 static int __pipe_fd;
 
-extern "C" void InitializeSolver() {
+SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSolver, void) {
   __instance_id = flags().instance_id;
   __session_id = flags().session_id;
   __pipe_fd = flags().pipe_fd;
@@ -1035,7 +1047,8 @@ extern "C" void InitializeSolver() {
        __instance_id, __session_id, __pipe_fd);
 }
 // filter?
-SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL u32 __taint_trace_callstack;
+SANITIZER_INTERFACE_ATTRIBUTE SANITIZER_WEAK_ATTRIBUTE THREADLOCAL u32
+    __taint_trace_callstack;
 
 static u8 get_const_result(u64 c1, u64 c2, u32 predicate) {
   switch (predicate) {
@@ -1074,9 +1087,9 @@ static inline void __solve_cond(dfsan_label label, u8 result, u8 add_nested, u32
   internal_write(__pipe_fd, &msg, sizeof(msg));
 }
 
-extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-__taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
-                  u64 c1, u64 c2, u32 cid) {
+SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_trace_cmp, dfsan_label op1,
+                             dfsan_label op2, u32 size, u32 predicate, u64 c1,
+                             u64 c2, u32 cid) {
   if ((op1 == 0 && op2 == 0))
     return 0;
 
