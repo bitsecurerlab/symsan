@@ -119,3 +119,8 @@ add_custom_command(OUTPUT ${taint_linker_script_filename}
 add_dependencies(dfsan taint_linker_script)
 install(FILES ${taint_linker_script_filename}
   DESTINATION ${COMPILER_RT_LIBRARY_INSTALL_DIR})
+
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../dfsan_interface.h
+              ${CMAKE_CURRENT_SOURCE_DIR}/../common_interface_defs.h
+              ${PROJECT_SOURCE_DIR}/include/defs.h
+  DESTINATION ${CMAKE_INSTALL_PREFIX}/include/symsan)
