@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 #include <algorithm>
+#include <string>
 
 #define OPTIMISTIC 1
 
@@ -77,6 +78,214 @@ static inline void set_branch_dep(size_t n, branch_dep_t* dep) {
 }
 
 static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps);
+
+static std::string format_simplified_expr(const z3::expr &expr, unsigned depth);
+
+static uint64_t mask_for_bits(unsigned bits) {
+  if (bits == 0 || bits >= 64) {
+    return UINT64_MAX;
+  }
+  return (1ULL << bits) - 1ULL;
+}
+
+static std::string format_bv_literal(const z3::expr &expr) {
+  unsigned bits = expr.get_sort().bv_size();
+  uint64_t raw = 0;
+  Z3_get_numeral_uint64(expr.ctx(), expr, &raw);
+  raw &= mask_for_bits(bits);
+
+  if (bits == 1) {
+    return raw ? "true" : "false";
+  }
+
+  int64_t signed_value = 0;
+  if (bits == 0 || bits >= 64) {
+    signed_value = static_cast<int64_t>(raw);
+  } else if (raw & (1ULL << (bits - 1))) {
+    signed_value = static_cast<int64_t>(raw | ~mask_for_bits(bits));
+  } else {
+    signed_value = static_cast<int64_t>(raw);
+  }
+
+  if (signed_value < 0 && signed_value >= -4096) {
+    return std::to_string(signed_value);
+  }
+  if (raw <= 9) {
+    return std::to_string(raw);
+  }
+
+  char buf[32];
+  internal_snprintf(buf, sizeof(buf), "0x%llx",
+                    static_cast<unsigned long long>(raw));
+  return std::string(buf);
+}
+
+static const char *c_int_type_name(unsigned bits, bool is_signed) {
+  switch (bits) {
+    case 8:  return is_signed ? "int8_t" : "uint8_t";
+    case 16: return is_signed ? "int16_t" : "uint16_t";
+    case 32: return is_signed ? "int32_t" : "uint32_t";
+    case 64: return is_signed ? "int64_t" : "uint64_t";
+    default: return is_signed ? "int64_t" : "uint64_t";
+  }
+}
+
+static std::string format_cast(const char *type_name, const z3::expr &arg,
+                               unsigned depth) {
+  return "((" + std::string(type_name) + ") " + format_simplified_expr(arg, depth + 1) + ")";
+}
+
+static std::string format_binary(const char *op, const z3::expr &lhs,
+                                 const z3::expr &rhs, unsigned depth) {
+  return "(" + format_simplified_expr(lhs, depth + 1) + " " + op + " " +
+         format_simplified_expr(rhs, depth + 1) + ")";
+}
+
+static std::string format_nary(const char *op, const z3::expr &expr,
+                               unsigned depth) {
+  unsigned argc = expr.num_args();
+  if (argc == 0) {
+    return expr.to_string();
+  }
+  if (argc == 1) {
+    return format_simplified_expr(expr.arg(0), depth + 1);
+  }
+
+  std::string out = "(" + format_simplified_expr(expr.arg(0), depth + 1);
+  for (unsigned i = 1; i < argc; ++i) {
+    out += " ";
+    out += op;
+    out += " ";
+    out += format_simplified_expr(expr.arg(i), depth + 1);
+  }
+  out += ")";
+  return out;
+}
+
+static std::string format_binary_strings(const char *op, const std::string &lhs,
+                                         const std::string &rhs) {
+  return "(" + lhs + " " + op + " " + rhs + ")";
+}
+
+static std::string format_simplified_expr(const z3::expr &expr, unsigned depth) {
+  if (depth > 32) {
+    return "...";
+  }
+  if (expr.is_true()) {
+    return "true";
+  }
+  if (expr.is_false()) {
+    return "false";
+  }
+  if (expr.is_numeral()) {
+    return format_bv_literal(expr);
+  }
+  if (expr.is_const() && expr.num_args() == 0) {
+    z3::symbol name = expr.decl().name();
+    if (name.kind() == Z3_INT_SYMBOL) {
+      return "input(" + std::to_string(name.to_int()) + ")";
+    }
+    if (name.kind() == Z3_STRING_SYMBOL) {
+      return std::string(name.str());
+    }
+  }
+
+  switch (expr.decl().decl_kind()) {
+    case Z3_OP_BNOT:
+      return "(~" + format_simplified_expr(expr.arg(0), depth + 1) + ")";
+    case Z3_OP_NOT:
+      return "(!" + format_simplified_expr(expr.arg(0), depth + 1) + ")";
+    case Z3_OP_BNEG:
+      return "(-" + format_simplified_expr(expr.arg(0), depth + 1) + ")";
+    case Z3_OP_BADD:
+      return format_nary("+", expr, depth);
+    case Z3_OP_BSUB:
+      return format_binary("-", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_BMUL:
+      return format_nary("*", expr, depth);
+    case Z3_OP_BAND:
+      return format_nary("&", expr, depth);
+    case Z3_OP_BOR:
+      return format_nary("|", expr, depth);
+    case Z3_OP_BXOR:
+      return format_nary("^", expr, depth);
+    case Z3_OP_AND:
+      return format_nary("&&", expr, depth);
+    case Z3_OP_OR:
+      return format_nary("||", expr, depth);
+    case Z3_OP_XOR:
+      return format_nary("^", expr, depth);
+    case Z3_OP_BSHL:
+      return format_binary("<<", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_BLSHR:
+    case Z3_OP_BASHR:
+      return format_binary(">>", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_BUDIV:
+    case Z3_OP_BSDIV:
+      return format_binary("/", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_BUREM:
+    case Z3_OP_BSREM:
+    case Z3_OP_BSMOD:
+      return format_binary("%", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_EQ:
+      return format_binary("==", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_DISTINCT:
+      return format_binary("!=", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_ULT:
+      return format_binary("<", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_ULEQ:
+      return format_binary("<=", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_UGT:
+      return format_binary(">", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_UGEQ:
+      return format_binary(">=", expr.arg(0), expr.arg(1), depth);
+    case Z3_OP_SLT:
+      return format_binary_strings("<",
+                                   format_cast(c_int_type_name(expr.arg(0).get_sort().bv_size(), true), expr.arg(0), depth),
+                                   format_cast(c_int_type_name(expr.arg(1).get_sort().bv_size(), true), expr.arg(1), depth));
+    case Z3_OP_SLEQ:
+      return format_binary_strings("<=",
+                                   format_cast(c_int_type_name(expr.arg(0).get_sort().bv_size(), true), expr.arg(0), depth),
+                                   format_cast(c_int_type_name(expr.arg(1).get_sort().bv_size(), true), expr.arg(1), depth));
+    case Z3_OP_SGT:
+      return format_binary_strings(">",
+                                   format_cast(c_int_type_name(expr.arg(0).get_sort().bv_size(), true), expr.arg(0), depth),
+                                   format_cast(c_int_type_name(expr.arg(1).get_sort().bv_size(), true), expr.arg(1), depth));
+    case Z3_OP_SGEQ:
+      return format_binary_strings(">=",
+                                   format_cast(c_int_type_name(expr.arg(0).get_sort().bv_size(), true), expr.arg(0), depth),
+                                   format_cast(c_int_type_name(expr.arg(1).get_sort().bv_size(), true), expr.arg(1), depth));
+    case Z3_OP_ZERO_EXT: {
+      unsigned ext = Z3_get_decl_int_parameter(expr.ctx(), expr.decl(), 0);
+      return format_cast(c_int_type_name(expr.arg(0).get_sort().bv_size() + ext, false), expr.arg(0), depth);
+    }
+    case Z3_OP_SIGN_EXT: {
+      unsigned ext = Z3_get_decl_int_parameter(expr.ctx(), expr.decl(), 0);
+      return format_cast(c_int_type_name(expr.arg(0).get_sort().bv_size() + ext, true), expr.arg(0), depth);
+    }
+    case Z3_OP_EXTRACT: {
+      unsigned hi = Z3_get_decl_int_parameter(expr.ctx(), expr.decl(), 0);
+      unsigned lo = Z3_get_decl_int_parameter(expr.ctx(), expr.decl(), 1);
+      uint64_t mask = mask_for_bits(hi - lo + 1);
+      char mask_buf[32];
+      internal_snprintf(mask_buf, sizeof(mask_buf), "0x%llx",
+                        static_cast<unsigned long long>(mask));
+      return "(((" + format_simplified_expr(expr.arg(0), depth + 1) + ") >> " +
+             std::to_string(lo) + ") & " + std::string(mask_buf) + ")";
+    }
+    case Z3_OP_CONCAT:
+      return "concat(" + format_simplified_expr(expr.arg(0), depth + 1) + ", " +
+             format_simplified_expr(expr.arg(1), depth + 1) + ")";
+    case Z3_OP_ITE:
+      return "(" + format_simplified_expr(expr.arg(0), depth + 1) + " ? " +
+             format_simplified_expr(expr.arg(1), depth + 1) + " : " +
+             format_simplified_expr(expr.arg(2), depth + 1) + ")";
+    default:
+      break;
+  }
+
+  return expr.to_string();
+}
 
 static bool collect_nested_constraint_labels(dfsan_label label,
                                              std::vector<dfsan_label> &labels) {
@@ -572,6 +781,27 @@ dfsan_get_nested_constraints(dfsan_label label, dfsan_label *out, size_t capacit
     }
   }
   return labels.size();
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
+dfsan_format_simplified_expression(dfsan_label label, char *out, size_t capacity) {
+  std::unordered_set<u32> deps;
+  std::string rendered;
+
+  try {
+    z3::expr simplified = serialize(label, deps).simplify();
+    rendered = format_simplified_expr(simplified, 0);
+  } catch (z3::exception const &) {
+    return 0;
+  }
+
+  size_t needed = rendered.size();
+  if (out != nullptr && capacity != 0) {
+    size_t n = std::min(capacity - 1, needed);
+    internal_memcpy(out, rendered.data(), n);
+    out[n] = '\0';
+  }
+  return needed;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
