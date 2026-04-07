@@ -16,6 +16,10 @@
 
 using namespace __dfsan;
 
+extern "C" bool symsan_find_load_concretization_for_label(
+    dfsan_label load_label, dfsan_label *addr_label, uint64_t *concrete_addr,
+    uint64_t *concrete_value, uint64_t *pc) __attribute__((weak));
+
 // for output
 static const char* __output_dir;
 static u32 __instance_id;
@@ -56,6 +60,8 @@ struct expr_equal {
   }
 };
 typedef std::unordered_set<z3::expr, expr_hash, expr_equal> expr_set_t;
+static expr_set_t __load_expr_deps;
+static bool __collect_load_expr_deps = false;
 typedef struct {
   expr_set_t expr_deps;
   std::unordered_set<dfsan_label> input_deps;
@@ -78,6 +84,18 @@ static inline void set_branch_dep(size_t n, branch_dep_t* dep) {
 }
 
 static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps);
+
+static inline expr_set_t take_load_expr_deps() {
+  expr_set_t out;
+  out.swap(__load_expr_deps);
+  __collect_load_expr_deps = false;
+  return out;
+}
+
+static inline void begin_load_expr_dep_collection() {
+  __load_expr_deps.clear();
+  __collect_load_expr_deps = true;
+}
 
 static std::string format_simplified_expr(const z3::expr &expr, unsigned depth);
 
@@ -407,8 +425,49 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
       out = z3::concat(__z3_context.constant(symbol, sort), out);
       deps.insert(offset + i);
     }
+    if (__collect_load_expr_deps &&
+        symsan_find_load_concretization_for_label != nullptr) {
+      dfsan_label addr_label = 0;
+      uint64_t concrete_addr = 0;
+      uint64_t concrete_value = 0;
+      uint64_t pc = 0;
+      if (symsan_find_load_concretization_for_label(label, &addr_label,
+                                                    &concrete_addr,
+                                                    &concrete_value, &pc) &&
+          addr_label != 0) {
+        z3::expr addr = serialize(addr_label, deps).simplify();
+        if (!addr.is_bv()) {
+          throw z3::exception("symbolic load address is not a bit-vector");
+        }
+        __load_expr_deps.insert(
+            addr == __z3_context.bv_val(concrete_addr, addr.get_sort().bv_size()));
+      }
+    }
     tsize_cache[label] = 1; // lazy init
     return cache_expr(label, out, deps);
+  } else if (info->op == LoadAddr) {
+    dfsan_label addr_label = info->l1;
+    uint64_t concrete_addr = 0;
+    uint64_t concrete_value = 0;
+    uint64_t pc = 0;
+
+    if (symsan_find_load_concretization_for_label == nullptr ||
+        !symsan_find_load_concretization_for_label(label, &addr_label,
+                                                   &concrete_addr,
+                                                   &concrete_value, &pc)) {
+      throw z3::exception("missing symbolic-address load concretization");
+    }
+    if (__collect_load_expr_deps && addr_label != 0) {
+      z3::expr addr = serialize(addr_label, deps).simplify();
+      if (!addr.is_bv()) {
+        throw z3::exception("symbolic load address is not a bit-vector");
+      }
+      __load_expr_deps.insert(
+          addr == __z3_context.bv_val(concrete_addr, addr.get_sort().bv_size()));
+    }
+    tsize_cache[label] = 1;
+    return cache_expr(label,
+                      __z3_context.bv_val(concrete_value, info->size), deps);
   } else if (info->op == ZExt) {
     z3::expr base = serialize(info->l1, deps);
     if (base.is_bool()) // dirty hack since llvm lacks bool
@@ -623,7 +682,9 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
   bool pushed = false;
   try {
     std::unordered_set<dfsan_label> inputs;
+    begin_load_expr_dep_collection();
     z3::expr cond = serialize(label, inputs);
+    expr_set_t load_expr_deps = take_load_expr_deps();
 
 #if 0
     if (get_label_info(label)->tree_size > 50000) {
@@ -664,6 +725,11 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
         }
       }
     }
+    for (auto &expr : load_expr_deps) {
+      if (added.insert(expr).second) {
+        __z3_solver.add(expr);
+      }
+    }
     assert(__z3_solver.check() == z3::sat);
     
     z3::expr e = (cond != result);
@@ -688,6 +754,7 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
         } else {
           c->input_deps.insert(inputs.begin(), inputs.end());
           c->expr_deps.insert(cond == result);
+          c->expr_deps.insert(load_expr_deps.begin(), load_expr_deps.end());
           c->cond_labels.insert(label);
         }
       }
@@ -866,7 +933,9 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   u8 size = get_label_info(index_label)->size;
   try {
     std::unordered_set<dfsan_label> inputs;
+    begin_load_expr_dep_collection();
     z3::expr i = serialize(index_label, inputs);
+    expr_set_t load_expr_deps = take_load_expr_deps();
     z3::expr r = __z3_context.bv_val(index, size);
 
     // collect additional input deps
@@ -897,6 +966,11 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
             __z3_solver.add(expr);
           }
         }
+      }
+    }
+    for (auto &expr : load_expr_deps) {
+      if (added.insert(expr).second) {
+        __z3_solver.add(expr);
       }
     }
     assert(__z3_solver.check() == z3::sat);
@@ -946,6 +1020,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
       } else {
         c->input_deps.insert(inputs.begin(), inputs.end());
         c->expr_deps.insert(i == r);
+        c->expr_deps.insert(load_expr_deps.begin(), load_expr_deps.end());
       }
     }
 
@@ -968,7 +1043,9 @@ static void __add_constraints(dfsan_label label) {
 
   try {
     std::unordered_set<dfsan_label> inputs;
+    begin_load_expr_dep_collection();
     z3::expr cond = serialize(label, inputs);
+    expr_set_t load_expr_deps = take_load_expr_deps();
     for (auto off : inputs) {
       auto c = get_branch_dep(off);
       if (c == nullptr) {
@@ -980,6 +1057,7 @@ static void __add_constraints(dfsan_label label) {
       } else {
         c->input_deps.insert(inputs.begin(), inputs.end());
         c->expr_deps.insert(cond);
+        c->expr_deps.insert(load_expr_deps.begin(), load_expr_deps.end());
       }
     }
   } catch (z3::exception e) {
