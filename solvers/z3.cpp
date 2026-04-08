@@ -16,7 +16,7 @@
 
 using namespace __dfsan;
 
-extern "C" bool symsan_find_load_concretization_for_label(
+extern "C" bool symsan_find_load_metadata_for_label(
     dfsan_label load_label, dfsan_label *addr_label, uint64_t *concrete_addr,
     uint64_t *concrete_value, uint64_t *pc) __attribute__((weak));
 
@@ -83,7 +83,13 @@ static inline void set_branch_dep(size_t n, branch_dep_t* dep) {
   __branch_deps.at(n) = dep;
 }
 
-static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps);
+enum class SerializeMode {
+  Solve,
+  Format,
+};
+
+static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
+                          SerializeMode mode);
 
 static inline expr_set_t take_load_expr_deps() {
   expr_set_t out;
@@ -98,6 +104,11 @@ static inline void begin_load_expr_dep_collection() {
 }
 
 static std::string format_simplified_expr(const z3::expr &expr, unsigned depth);
+
+static std::string make_display_load_name(unsigned bits,
+                                          const std::string &addr_expr) {
+  return "load" + std::to_string(bits) + "(" + addr_expr + ")";
+}
 
 static uint64_t mask_for_bits(unsigned bits) {
   if (bits == 0 || bits >= 64) {
@@ -317,7 +328,7 @@ static bool collect_nested_constraint_labels(dfsan_label label,
   }
 
   try {
-    serialize(label, inputs);
+    serialize(label, inputs, SerializeMode::Solve);
   } catch (z3::exception const &) {
     return false;
   }
@@ -388,7 +399,8 @@ static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, std::uno
   return e;
 }
 
-static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
+static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
+                          SerializeMode mode) {
   if (label < CONST_OFFSET || label == kInitializingLabel) {
     Report("WARNING: invalid label: %d\n", label);
     throw z3::exception("invalid label");
@@ -425,17 +437,38 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
       out = z3::concat(__z3_context.constant(symbol, sort), out);
       deps.insert(offset + i);
     }
-    if (__collect_load_expr_deps &&
-        symsan_find_load_concretization_for_label != nullptr) {
+    if (mode == SerializeMode::Format &&
+        symsan_find_load_metadata_for_label != nullptr) {
       dfsan_label addr_label = 0;
       uint64_t concrete_addr = 0;
       uint64_t concrete_value = 0;
       uint64_t pc = 0;
-      if (symsan_find_load_concretization_for_label(label, &addr_label,
-                                                    &concrete_addr,
-                                                    &concrete_value, &pc) &&
+      if (symsan_find_load_metadata_for_label(label, &addr_label,
+                                              &concrete_addr,
+                                              &concrete_value, &pc) &&
           addr_label != 0) {
-        z3::expr addr = serialize(addr_label, deps).simplify();
+        z3::expr addr = serialize(addr_label, deps, mode).simplify();
+        std::string addr_rendered = format_simplified_expr(addr, 0);
+        z3::symbol load_symbol =
+            __z3_context.str_symbol(
+                make_display_load_name(out.get_sort().bv_size(), addr_rendered).c_str());
+        tsize_cache[label] = 1;
+        return cache_expr(label,
+                          __z3_context.constant(load_symbol, out.get_sort()),
+                          deps);
+      }
+    }
+    if (__collect_load_expr_deps &&
+        symsan_find_load_metadata_for_label != nullptr) {
+      dfsan_label addr_label = 0;
+      uint64_t concrete_addr = 0;
+      uint64_t concrete_value = 0;
+      uint64_t pc = 0;
+      if (symsan_find_load_metadata_for_label(label, &addr_label,
+                                              &concrete_addr,
+                                              &concrete_value, &pc) &&
+          addr_label != 0) {
+        z3::expr addr = serialize(addr_label, deps, mode).simplify();
         if (!addr.is_bv()) {
           throw z3::exception("symbolic load address is not a bit-vector");
         }
@@ -445,31 +478,8 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     }
     tsize_cache[label] = 1; // lazy init
     return cache_expr(label, out, deps);
-  } else if (info->op == LoadAddr) {
-    dfsan_label addr_label = info->l1;
-    uint64_t concrete_addr = 0;
-    uint64_t concrete_value = 0;
-    uint64_t pc = 0;
-
-    if (symsan_find_load_concretization_for_label == nullptr ||
-        !symsan_find_load_concretization_for_label(label, &addr_label,
-                                                   &concrete_addr,
-                                                   &concrete_value, &pc)) {
-      throw z3::exception("missing symbolic-address load concretization");
-    }
-    if (__collect_load_expr_deps && addr_label != 0) {
-      z3::expr addr = serialize(addr_label, deps).simplify();
-      if (!addr.is_bv()) {
-        throw z3::exception("symbolic load address is not a bit-vector");
-      }
-      __load_expr_deps.insert(
-          addr == __z3_context.bv_val(concrete_addr, addr.get_sort().bv_size()));
-    }
-    tsize_cache[label] = 1;
-    return cache_expr(label,
-                      __z3_context.bv_val(concrete_value, info->size), deps);
   } else if (info->op == ZExt) {
-    z3::expr base = serialize(info->l1, deps);
+    z3::expr base = serialize(info->l1, deps, mode);
     if (base.is_bool()) // dirty hack since llvm lacks bool
       base = z3::ite(base, __z3_context.bv_val(1, 1),
                            __z3_context.bv_val(0, 1));
@@ -477,23 +487,23 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, z3::zext(base, info->size - base_size), deps);
   } else if (info->op == SExt) {
-    z3::expr base = serialize(info->l1, deps);
+    z3::expr base = serialize(info->l1, deps, mode);
     u32 base_size = base.get_sort().bv_size();
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, z3::sext(base, info->size - base_size), deps);
   } else if (info->op == Trunc) {
-    z3::expr base = serialize(info->l1, deps);
+    z3::expr base = serialize(info->l1, deps, mode);
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, base.extract(info->size - 1, 0), deps);
   } else if (info->op == Extract) {
-    z3::expr base = serialize(info->l1, deps);
+    z3::expr base = serialize(info->l1, deps, mode);
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
     return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps);
   } else if (info->op == Not) {
     if (info->l2 == 0 || info->size != 1) {
       throw z3::exception("invalid Not operation");
     }
-    z3::expr e = serialize(info->l2, deps);
+    z3::expr e = serialize(info->l2, deps, mode);
     tsize_cache[label] = tsize_cache[info->l2]; // lazy init
     if (!e.is_bool()) {
       throw z3::exception("Only LNot should be recorded");
@@ -503,21 +513,21 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
     if (info->l2 == 0) {
       throw z3::exception("invalid Neg predicate");
     }
-    z3::expr e = serialize(info->l2, deps);
+    z3::expr e = serialize(info->l2, deps, mode);
     tsize_cache[label] = tsize_cache[info->l2]; // lazy init
     return cache_expr(label, -e, deps);
   } else if (info->op == IntToPtr) {
-    z3::expr e = serialize(info->l1, deps);
+    z3::expr e = serialize(info->l1, deps, mode);
     return cache_expr(label, e, deps);
   }
   // higher-order
   else if (info->op == fmemcmp) {
-    z3::expr op1 = (info->l1 >= CONST_OFFSET) ? serialize(info->l1, deps) :
+    z3::expr op1 = (info->l1 >= CONST_OFFSET) ? serialize(info->l1, deps, mode) :
                    read_concrete(info->op1.i, info->size); // memcmp size in bytes
     if (info->l2 < CONST_OFFSET) {
       throw z3::exception("invalid memcmp operand2");
     }
-    z3::expr op2 = serialize(info->l2, deps);
+    z3::expr op2 = serialize(info->l2, deps, mode);
     tsize_cache[label] = 1; // lazy init
     // don't cache becaue of read_concrete?
     return z3::ite(op1 == op2, __z3_context.bv_val(0, 32),
@@ -547,7 +557,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   }
   z3::expr op1 = __z3_context.bv_val((uint64_t)info->op1.i, size);
   if (info->l1 >= CONST_OFFSET) {
-    op1 = serialize(info->l1, deps).simplify();
+    op1 = serialize(info->l1, deps, mode).simplify();
   } else if (info->size == 1) {
     op1 = __z3_context.bool_val(info->op1.i == 1);
   }
@@ -558,7 +568,7 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps) {
   z3::expr op2 = __z3_context.bv_val((uint64_t)info->op2.i, size);
   if (info->l2 >= CONST_OFFSET) {
     std::unordered_set<u32> deps2;
-    op2 = serialize(info->l2, deps2).simplify();
+    op2 = serialize(info->l2, deps2, mode).simplify();
     deps.insert(deps2.begin(),deps2.end());
   } else if (info->size == 1) {
     op2 = __z3_context.bool_val(info->op2.i == 1);
@@ -683,7 +693,7 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
   try {
     std::unordered_set<dfsan_label> inputs;
     begin_load_expr_dep_collection();
-    z3::expr cond = serialize(label, inputs);
+    z3::expr cond = serialize(label, inputs, SerializeMode::Solve);
     expr_set_t load_expr_deps = take_load_expr_deps();
 
 #if 0
@@ -856,7 +866,7 @@ dfsan_format_simplified_expression(dfsan_label label, char *out, size_t capacity
   std::string rendered;
 
   try {
-    z3::expr simplified = serialize(label, deps).simplify();
+    z3::expr simplified = serialize(label, deps, SerializeMode::Format).simplify();
     rendered = format_simplified_expr(simplified, 0);
   } catch (z3::exception const &) {
     return 0;
@@ -934,7 +944,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
   try {
     std::unordered_set<dfsan_label> inputs;
     begin_load_expr_dep_collection();
-    z3::expr i = serialize(index_label, inputs);
+    z3::expr i = serialize(index_label, inputs, SerializeMode::Solve);
     expr_set_t load_expr_deps = take_load_expr_deps();
     z3::expr r = __z3_context.bv_val(index, size);
 
@@ -995,10 +1005,10 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr, dfsan_label index_label, 
           // if the buffer size is input-dependent (not fixed)
           // check if over flow is possible
           std::unordered_set<dfsan_label> dummy;
-          z3::expr bs = serialize(bounds->l2, dummy); // size label
+          z3::expr bs = serialize(bounds->l2, dummy, SerializeMode::Solve); // size label
           if (bounds->l1) {
             dummy.clear();
-            z3::expr be = serialize(bounds->l1, dummy); // elements label
+            z3::expr be = serialize(bounds->l1, dummy, SerializeMode::Solve); // elements label
             bs = bs * be;
           }
           z3::expr e = z3::ugt(idx * es * co, bs);
@@ -1044,7 +1054,7 @@ static void __add_constraints(dfsan_label label) {
   try {
     std::unordered_set<dfsan_label> inputs;
     begin_load_expr_dep_collection();
-    z3::expr cond = serialize(label, inputs);
+    z3::expr cond = serialize(label, inputs, SerializeMode::Solve);
     expr_set_t load_expr_deps = take_load_expr_deps();
     for (auto off : inputs) {
       auto c = get_branch_dep(off);

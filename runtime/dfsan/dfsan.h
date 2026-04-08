@@ -17,6 +17,7 @@
 
 #include "sanitizer_common/sanitizer_internal_defs.h"
 #include "dfsan_platform.h"
+#include <string.h>
 #include <stdio.h>
 #include <map>
 
@@ -198,7 +199,7 @@ enum operators {
   // higher-order
   fmemcmp   = last_llvm_op + 7,
   fsize     = last_llvm_op + 8,
-  LoadAddr  = last_llvm_op + 9,
+  /* last_llvm_op + 9 was previously reserved for LoadAddr */
   Ite       = last_llvm_op + 10,
 };
 

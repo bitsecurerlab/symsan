@@ -199,7 +199,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
   }
 
   // special handling for bounds, which may use all four fields
-  if (op != Alloca && op != LoadAddr) {
+  if (op != Alloca) {
     if (l1 >= CONST_OFFSET) op1 = 0;
     if (l2 >= CONST_OFFSET) op2 = 0;
   }
