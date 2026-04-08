@@ -641,6 +641,30 @@ dfsan_get_label(const void *addr) {
   return *shadow_for(addr);
 }
 
+SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_region_is_concrete(const void *addr, uptr size) {
+  const u8 *cursor = reinterpret_cast<const u8 *>(addr);
+  uptr remaining = size;
+
+  while (remaining > 0) {
+    uptr page_bytes = Min(kPageSize - pageOffset(const_cast<u8 *>(cursor)), remaining);
+    const dfsan_label *shadow = shadow_for(cursor);
+
+    if (shadow != nullptr) {
+      for (uptr i = 0; i < page_bytes; ++i) {
+        if (shadow[i] != 0) {
+          return 0;
+        }
+      }
+    }
+
+    cursor += page_bytes;
+    remaining -= page_bytes;
+  }
+
+  return 1;
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label_info *dfsan_get_label_info(dfsan_label label) {
   dfsan_check_label(label);

@@ -96,6 +96,9 @@ dfsan_label dfsan_read_label(const void *addr, size_t size);
 
 void dfsan_store_label(dfsan_label l, void *addr, size_t size);
 
+/// Returns non-zero when every byte in [addr, addr + size) is concrete.
+int dfsan_region_is_concrete(const void *addr, size_t size);
+
 /// Retrieves the starting address for the shadow memory of the given address
 const dfsan_label * dfsan_shadow_for(const void * addr);
 
