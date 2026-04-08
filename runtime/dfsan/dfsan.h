@@ -82,8 +82,10 @@ dfsan_label dfsan_create_label(off_t offset);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
 int dfsan_is_branch_condition_label(dfsan_label label);
+int dfsan_get_branch_direction(dfsan_label label, uint8_t *taken);
 uptr dfsan_get_nested_constraint_count(dfsan_label label);
 uptr dfsan_get_nested_constraints(dfsan_label label, dfsan_label *out, uptr capacity);
+uptr dfsan_get_nested_constraint_directions(dfsan_label label, uint8_t *out, uptr capacity);
 uptr dfsan_format_simplified_expression(dfsan_label label, char *out, uptr capacity);
 
 // taint source

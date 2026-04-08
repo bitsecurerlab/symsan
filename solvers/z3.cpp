@@ -65,7 +65,7 @@ static bool __collect_load_expr_deps = false;
 typedef struct {
   expr_set_t expr_deps;
   std::unordered_set<dfsan_label> input_deps;
-  std::unordered_set<dfsan_label> cond_labels;
+  std::unordered_map<dfsan_label, bool> cond_directions;
 } branch_dep_t;
 static std::vector<branch_dep_t*> __branch_deps;
 
@@ -316,8 +316,110 @@ static std::string format_simplified_expr(const z3::expr &expr, unsigned depth) 
   return expr.to_string();
 }
 
+static bool eval_cmp_taken(u32 predicate, u32 size, u64 c1, u64 c2) {
+  const unsigned bits = size;
+  const uint64_t mask = (bits == 0 || bits >= 64) ? UINT64_MAX : ((1ULL << bits) - 1ULL);
+  const uint64_t lhs = c1 & mask;
+  const uint64_t rhs = c2 & mask;
+
+  auto sext = [bits](uint64_t value) -> int64_t {
+    if (bits == 0 || bits >= 64) {
+      return static_cast<int64_t>(value);
+    }
+    const uint64_t sign_bit = 1ULL << (bits - 1);
+    if (value & sign_bit) {
+      return static_cast<int64_t>(value | ~((1ULL << bits) - 1ULL));
+    }
+    return static_cast<int64_t>(value);
+  };
+
+  switch (predicate) {
+  case bveq:
+    return lhs == rhs;
+  case bvneq:
+    return lhs != rhs;
+  case bvugt:
+    return lhs > rhs;
+  case bvuge:
+    return lhs >= rhs;
+  case bvult:
+    return lhs < rhs;
+  case bvule:
+    return lhs <= rhs;
+  case bvsgt:
+    return sext(lhs) > sext(rhs);
+  case bvsge:
+    return sext(lhs) >= sext(rhs);
+  case bvslt:
+    return sext(lhs) < sext(rhs);
+  case bvsle:
+    return sext(lhs) <= sext(rhs);
+  default:
+    return false;
+  }
+}
+
+static bool get_branch_direction(dfsan_label label, bool *taken) {
+  std::unordered_set<u32> inputs;
+
+  if (!dfsan_is_branch_condition_label(label)) {
+    return false;
+  }
+
+  try {
+    serialize(label, inputs, SerializeMode::Format);
+  } catch (z3::exception const &) {
+    return false;
+  }
+
+  for (auto off : inputs) {
+    auto deps = get_branch_dep(off);
+    if (deps == nullptr) {
+      continue;
+    }
+    auto it = deps->cond_directions.find(label);
+    if (it != deps->cond_directions.end()) {
+      if (taken != nullptr) {
+        *taken = it->second;
+      }
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void record_branch_inputs(dfsan_label label, bool taken) {
+  std::unordered_set<u32> inputs;
+
+  if (!dfsan_is_branch_condition_label(label)) {
+    return;
+  }
+
+  try {
+    serialize(label, inputs, SerializeMode::Format);
+  } catch (z3::exception const &) {
+    return;
+  }
+
+  for (auto off : inputs) {
+    auto c = get_branch_dep(off);
+    if (c == nullptr) {
+      c = new branch_dep_t();
+      set_branch_dep(off, c);
+    }
+    if (c == nullptr) {
+      Report("WARNING: out of memory\n");
+      continue;
+    }
+    c->input_deps.insert(inputs.begin(), inputs.end());
+    c->cond_directions[label] = taken;
+  }
+}
+
 static bool collect_nested_constraint_labels(dfsan_label label,
-                                             std::vector<dfsan_label> &labels) {
+                                             std::vector<dfsan_label> &labels,
+                                             std::vector<uint8_t> *directions = nullptr) {
   std::unordered_set<u32> inputs;
   std::vector<dfsan_label> ordered;
   std::unordered_set<dfsan_label> seen;
@@ -328,7 +430,7 @@ static bool collect_nested_constraint_labels(dfsan_label label,
   }
 
   try {
-    serialize(label, inputs, SerializeMode::Solve);
+    serialize(label, inputs, SerializeMode::Format);
   } catch (z3::exception const &) {
     return false;
   }
@@ -347,7 +449,8 @@ static bool collect_nested_constraint_labels(dfsan_label label,
         worklist.push_back(input);
       }
     }
-    for (auto cond_label : deps->cond_labels) {
+    for (const auto &entry : deps->cond_directions) {
+      dfsan_label cond_label = entry.first;
       if (cond_label != label && seen.insert(cond_label).second) {
         ordered.push_back(cond_label);
       }
@@ -355,6 +458,17 @@ static bool collect_nested_constraint_labels(dfsan_label label,
   }
 
   std::sort(ordered.begin(), ordered.end());
+  if (directions != nullptr) {
+    directions->clear();
+    directions->reserve(ordered.size());
+    for (auto cond_label : ordered) {
+      bool taken = false;
+      if (!get_branch_direction(cond_label, &taken)) {
+        taken = false;
+      }
+      directions->push_back(taken ? 1 : 0);
+    }
+  }
   labels.swap(ordered);
   return true;
 }
@@ -393,9 +507,13 @@ static z3::expr get_cmd(z3::expr const &lhs, z3::expr const &rhs, u32 predicate)
   Die();
 }
 
-static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e, std::unordered_set<u32> &deps) {
-  expr_cache.insert({label,e});
-  deps_cache.insert({label,deps});
+static inline z3::expr cache_expr(dfsan_label label, z3::expr const &e,
+                                  std::unordered_set<u32> &deps,
+                                  SerializeMode mode) {
+  if (mode == SerializeMode::Format) {
+    expr_cache.insert({label, e});
+    deps_cache.insert({label, deps});
+  }
   return e;
 }
 
@@ -410,11 +528,13 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
   AOUT("%u = (l1:%u, l2:%u, op:%u, size:%u, op1:%llu, op2:%llu)\n",
        label, info->l1, info->l2, info->op, info->size, info->op1.i, info->op2.i);
 
-  auto expr_itr = expr_cache.find(label);
-  if (expr_itr != expr_cache.end()) {
-    auto deps_itr = deps_cache.find(label);
-    deps.insert(deps_itr->second.begin(), deps_itr->second.end());
-    return expr_itr->second;
+  if (mode == SerializeMode::Format) {
+    auto expr_itr = expr_cache.find(label);
+    if (expr_itr != expr_cache.end()) {
+      auto deps_itr = deps_cache.find(label);
+      deps.insert(deps_itr->second.begin(), deps_itr->second.end());
+      return expr_itr->second;
+    }
   }
 
   // special ops
@@ -427,47 +547,32 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
     // caching is not super helpful
     return __z3_context.constant(symbol, sort);
   } else if (info->op == Load) {
-    u64 offset = get_label_info(info->l1)->op1.i;
-    z3::symbol symbol = __z3_context.int_symbol(offset);
-    z3::sort sort = __z3_context.bv_sort(8);
-    z3::expr out = __z3_context.constant(symbol, sort);
-    deps.insert(offset);
-    for (u32 i = 1; i < info->l2; i++) {
-      symbol = __z3_context.int_symbol(offset + i);
-      out = z3::concat(__z3_context.constant(symbol, sort), out);
-      deps.insert(offset + i);
-    }
-    if (mode == SerializeMode::Format &&
-        symsan_find_load_metadata_for_label != nullptr) {
-      dfsan_label addr_label = 0;
-      uint64_t concrete_addr = 0;
-      uint64_t concrete_value = 0;
-      uint64_t pc = 0;
-      if (symsan_find_load_metadata_for_label(label, &addr_label,
-                                              &concrete_addr,
-                                              &concrete_value, &pc) &&
-          addr_label != 0) {
+    dfsan_label addr_label = 0;
+    uint64_t concrete_addr = 0;
+    uint64_t concrete_value = 0;
+    uint64_t pc = 0;
+    bool has_load_metadata =
+        symsan_find_load_metadata_for_label != nullptr &&
+        symsan_find_load_metadata_for_label(label, &addr_label, &concrete_addr,
+                                            &concrete_value, &pc) &&
+        addr_label != 0;
+    z3::expr out = __z3_context.bv_val(0, info->size);
+
+    if (has_load_metadata) {
+      if (mode == SerializeMode::Format) {
         z3::expr addr = serialize(addr_label, deps, mode).simplify();
         std::string addr_rendered = format_simplified_expr(addr, 0);
         z3::symbol load_symbol =
             __z3_context.str_symbol(
-                make_display_load_name(out.get_sort().bv_size(), addr_rendered).c_str());
+                make_display_load_name(info->size, addr_rendered).c_str());
         tsize_cache[label] = 1;
         return cache_expr(label,
                           __z3_context.constant(load_symbol, out.get_sort()),
-                          deps);
+                          deps, mode);
       }
-    }
-    if (__collect_load_expr_deps &&
-        symsan_find_load_metadata_for_label != nullptr) {
-      dfsan_label addr_label = 0;
-      uint64_t concrete_addr = 0;
-      uint64_t concrete_value = 0;
-      uint64_t pc = 0;
-      if (symsan_find_load_metadata_for_label(label, &addr_label,
-                                              &concrete_addr,
-                                              &concrete_value, &pc) &&
-          addr_label != 0) {
+
+      out = __z3_context.bv_val(concrete_value, info->size);
+      if (__collect_load_expr_deps) {
         z3::expr addr = serialize(addr_label, deps, mode).simplify();
         if (!addr.is_bv()) {
           throw z3::exception("symbolic load address is not a bit-vector");
@@ -475,9 +580,20 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
         __load_expr_deps.insert(
             addr == __z3_context.bv_val(concrete_addr, addr.get_sort().bv_size()));
       }
+    } else {
+      u64 offset = get_label_info(info->l1)->op1.i;
+      z3::symbol symbol = __z3_context.int_symbol(offset);
+      z3::sort sort = __z3_context.bv_sort(8);
+      out = __z3_context.constant(symbol, sort);
+      deps.insert(offset);
+      for (u32 i = 1; i < info->l2; i++) {
+        symbol = __z3_context.int_symbol(offset + i);
+        out = z3::concat(__z3_context.constant(symbol, sort), out);
+        deps.insert(offset + i);
+      }
     }
     tsize_cache[label] = 1; // lazy init
-    return cache_expr(label, out, deps);
+    return cache_expr(label, out, deps, mode);
   } else if (info->op == ZExt) {
     z3::expr base = serialize(info->l1, deps, mode);
     if (base.is_bool()) // dirty hack since llvm lacks bool
@@ -485,20 +601,20 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
                            __z3_context.bv_val(0, 1));
     u32 base_size = base.get_sort().bv_size();
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr(label, z3::zext(base, info->size - base_size), deps);
+    return cache_expr(label, z3::zext(base, info->size - base_size), deps, mode);
   } else if (info->op == SExt) {
     z3::expr base = serialize(info->l1, deps, mode);
     u32 base_size = base.get_sort().bv_size();
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr(label, z3::sext(base, info->size - base_size), deps);
+    return cache_expr(label, z3::sext(base, info->size - base_size), deps, mode);
   } else if (info->op == Trunc) {
     z3::expr base = serialize(info->l1, deps, mode);
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr(label, base.extract(info->size - 1, 0), deps);
+    return cache_expr(label, base.extract(info->size - 1, 0), deps, mode);
   } else if (info->op == Extract) {
     z3::expr base = serialize(info->l1, deps, mode);
     tsize_cache[label] = tsize_cache[info->l1]; // lazy init
-    return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps);
+    return cache_expr(label, base.extract((info->op2.i + info->size) - 1, info->op2.i), deps, mode);
   } else if (info->op == Not) {
     if (info->l2 == 0 || info->size != 1) {
       throw z3::exception("invalid Not operation");
@@ -508,17 +624,17 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
     if (!e.is_bool()) {
       throw z3::exception("Only LNot should be recorded");
     }
-    return cache_expr(label, !e, deps);
+    return cache_expr(label, !e, deps, mode);
   } else if (info->op == Neg) {
     if (info->l2 == 0) {
       throw z3::exception("invalid Neg predicate");
     }
     z3::expr e = serialize(info->l2, deps, mode);
     tsize_cache[label] = tsize_cache[info->l2]; // lazy init
-    return cache_expr(label, -e, deps);
+    return cache_expr(label, -e, deps, mode);
   } else if (info->op == IntToPtr) {
     z3::expr e = serialize(info->l1, deps, mode);
-    return cache_expr(label, e, deps);
+    return cache_expr(label, e, deps, mode);
   }
   // higher-order
   else if (info->op == fmemcmp) {
@@ -578,23 +694,23 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
 
   switch((info->op & 0xff)) {
     // llvm doesn't distinguish between logical and bitwise and/or/xor
-    case And:     return cache_expr(label, info->size != 1 ? (op1 & op2) : (op1 && op2), deps);
-    case Or:      return cache_expr(label, info->size != 1 ? (op1 | op2) : (op1 || op2), deps);
-    case Xor:     return cache_expr(label, op1 ^ op2, deps);
-    case Shl:     return cache_expr(label, z3::shl(op1, op2), deps);
-    case LShr:    return cache_expr(label, z3::lshr(op1, op2), deps);
-    case AShr:    return cache_expr(label, z3::ashr(op1, op2), deps);
-    case Add:     return cache_expr(label, op1 + op2, deps);
-    case Sub:     return cache_expr(label, op1 - op2, deps);
-    case Mul:     return cache_expr(label, op1 * op2, deps);
-    case UDiv:    return cache_expr(label, z3::udiv(op1, op2), deps);
-    case SDiv:    return cache_expr(label, op1 / op2, deps);
-    case URem:    return cache_expr(label, z3::urem(op1, op2), deps);
-    case SRem:    return cache_expr(label, z3::srem(op1, op2), deps);
+    case And:     return cache_expr(label, info->size != 1 ? (op1 & op2) : (op1 && op2), deps, mode);
+    case Or:      return cache_expr(label, info->size != 1 ? (op1 | op2) : (op1 || op2), deps, mode);
+    case Xor:     return cache_expr(label, op1 ^ op2, deps, mode);
+    case Shl:     return cache_expr(label, z3::shl(op1, op2), deps, mode);
+    case LShr:    return cache_expr(label, z3::lshr(op1, op2), deps, mode);
+    case AShr:    return cache_expr(label, z3::ashr(op1, op2), deps, mode);
+    case Add:     return cache_expr(label, op1 + op2, deps, mode);
+    case Sub:     return cache_expr(label, op1 - op2, deps, mode);
+    case Mul:     return cache_expr(label, op1 * op2, deps, mode);
+    case UDiv:    return cache_expr(label, z3::udiv(op1, op2), deps, mode);
+    case SDiv:    return cache_expr(label, op1 / op2, deps, mode);
+    case URem:    return cache_expr(label, z3::urem(op1, op2), deps, mode);
+    case SRem:    return cache_expr(label, z3::srem(op1, op2), deps, mode);
     // relational
-    case ICmp:    return cache_expr(label, get_cmd(op1, op2, info->op >> 8), deps);
+    case ICmp:    return cache_expr(label, get_cmd(op1, op2, info->op >> 8), deps, mode);
     // concat
-    case Concat:  return cache_expr(label, z3::concat(op2, op1), deps); // little endian
+    case Concat:  return cache_expr(label, z3::concat(op2, op1), deps, mode); // little endian
     default:
       Printf("FATAL: unsupported op: %u\n", info->op);
       throw z3::exception("unsupported operator");
@@ -765,7 +881,7 @@ static void __solve_cond(dfsan_label label, z3::expr &result, bool add_nested, v
           c->input_deps.insert(inputs.begin(), inputs.end());
           c->expr_deps.insert(cond == result);
           c->expr_deps.insert(load_expr_deps.begin(), load_expr_deps.end());
-          c->cond_labels.insert(label);
+          c->cond_directions[label] = result.is_true();
         }
       }
     }
@@ -794,21 +910,11 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
     return 0;
   }
 
-  AOUT("solving cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
+  AOUT("recording cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
        op1, op2, size, predicate, c1, c2, cid, addr);
 
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
-
-  z3::expr bv_c1 = __z3_context.bv_val((uint64_t)c1, size);
-  z3::expr bv_c2 = __z3_context.bv_val((uint64_t)c2, size);
-  z3::expr result = get_cmd(bv_c1, bv_c2, predicate).simplify();
-
-  /*
-   * SymFit uses trace_cmp on path-condition labels produced by setcond.
-   * Retain the resolved condition as a nested constraint for the current path
-   * instead of approximating "taken" as a raw operand equality check.
-   */
-  __solve_cond(temp, result, true, addr);
+  record_branch_inputs(temp, eval_cmp_taken(predicate, size, c1, c2));
   return temp;
 }
 
@@ -827,11 +933,10 @@ __taint_trace_cond(dfsan_label label, u8 r, u32 cid) {
     return;
   }
 
-  AOUT("solving cond: %u %u 0x%x 0x%x %p %u\n",
+  AOUT("recording cond: %u %u 0x%x 0x%x %p %u\n",
        label, r, __taint_trace_callstack, cid, addr, itr->second);
 
-  z3::expr result = __z3_context.bool_val(r);
-  __solve_cond(label, result, true, addr);
+  record_branch_inputs(label, r != 0);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
@@ -842,6 +947,19 @@ dfsan_get_nested_constraint_count(dfsan_label label) {
     return 0;
   }
   return labels.size();
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_get_branch_direction(dfsan_label label, uint8_t *taken) {
+  bool direction = false;
+
+  if (!get_branch_direction(label, &direction)) {
+    return 0;
+  }
+  if (taken != nullptr) {
+    *taken = direction ? 1 : 0;
+  }
+  return 1;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
@@ -858,6 +976,23 @@ dfsan_get_nested_constraints(dfsan_label label, dfsan_label *out, size_t capacit
     }
   }
   return labels.size();
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
+dfsan_get_nested_constraint_directions(dfsan_label label, uint8_t *out, size_t capacity) {
+  std::vector<dfsan_label> labels;
+  std::vector<uint8_t> directions;
+
+  if (!collect_nested_constraint_labels(label, labels, &directions)) {
+    return 0;
+  }
+  if (out != nullptr && capacity != 0) {
+    size_t n = std::min(capacity, directions.size());
+    for (size_t i = 0; i < n; ++i) {
+      out[i] = directions[i];
+    }
+  }
+  return directions.size();
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE size_t
