@@ -913,7 +913,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
   AOUT("recording cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
        op1, op2, size, predicate, c1, c2, cid, addr);
 
-  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
+  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2, cid);
   record_branch_inputs(temp, eval_cmp_taken(predicate, size, c1, c2));
   return temp;
 }
@@ -1214,7 +1214,8 @@ static void __add_constraints(dfsan_label label) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, int64_t offset, unsigned size) {
-  dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, size, 0, offset);
+  dfsan_label_info *info = get_label_info(offset_label);
+  dfsan_label sc = dfsan_union(offset_label, 0, (bveq << 8) | ICmp, size, 0, offset, info->pc);
   __add_constraints(sc);
 }
 

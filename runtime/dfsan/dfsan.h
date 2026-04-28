@@ -19,7 +19,7 @@
 #include "dfsan_platform.h"
 #include <string.h>
 #include <stdio.h>
-#include <map>
+//#include <map> // This was causing issues, let's get rid of it.
 
 using __sanitizer::uptr;
 
@@ -50,6 +50,7 @@ struct dfsan_label_info {
   u16 op;
   u16 size; // FIXME: this limit the size of the operand to 65535 bits or bytes (in case of memcmp)
   u32 hash;
+  u64 pc;
 } __attribute__((aligned (8), packed));
 
 #ifndef PATH_MAX
@@ -72,13 +73,13 @@ struct taint_file {
 };
 
 extern "C" {
-void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size);
-void dfsan_set_label(dfsan_label label, void *addr, uptr size);
+void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size, u64 pc);
+void dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc);
 dfsan_label dfsan_read_label(const void *addr, uptr size);
-void dfsan_store_label(dfsan_label l1, void *addr, uptr size);
+void dfsan_store_label(dfsan_label l1, void *addr, uptr size, u64 pc);
 int dfsan_region_is_concrete(const void *addr, uptr size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
-                        u64 op1, u64 op2);
+                        u64 op1, u64 op2, u64 pc);
 dfsan_label dfsan_create_label(off_t offset);
 dfsan_label dfsan_get_label(const void *addr);
 dfsan_label_info* dfsan_get_label_info(dfsan_label label);
@@ -106,10 +107,10 @@ int is_utmp_taint(void);
 }  // extern "C"
 
 template <typename T>
-void dfsan_set_label(dfsan_label label, T &data) {  // NOLINT
-  dfsan_set_label(label, (void *)&data, sizeof(T));
+void dfsan_set_label(dfsan_label label, T &data, u64 pc) {  // NOLINT
+  dfsan_set_label(label, (void *)&data, sizeof(T), pc);
 }
-extern std::map<uintptr_t, dfsan_label *> g_shadow_pages;
+//extern std::map<uintptr_t, dfsan_label *> g_shadow_pages; // Removed and relocated to dfsan.cpp
 extern uptr shadow_memory;
 
 namespace __dfsan {
@@ -130,14 +131,9 @@ inline const uintptr_t pageOffset(void *addr) {
   return ((uintptr_t)addr & (kPageSize - 1));
 }
 
-inline dfsan_label *shadow_for(void *ptr) {
-  if (auto shadowPageIt = g_shadow_pages.find(pageStart(ptr));
-        shadowPageIt != g_shadow_pages.end()){
-      return shadowPageIt->second + pageOffset(ptr);
-      }
-  return nullptr;
-}
+//dfsan_label *shadow_for(void *ptr);
 
+/*
 inline dfsan_label *getOrCreateShadow(void *ptr, dfsan_label l) {
     if (auto *shadow = shadow_for(ptr))
       return shadow;
@@ -149,9 +145,12 @@ inline dfsan_label *getOrCreateShadow(void *ptr, dfsan_label l) {
     g_shadow_pages[pageStart(ptr)] = newShadow;
     return newShadow + pageOffset(ptr);
 }
+*/
+
+//dfsan_label *getOrCreateShadow(void *ptr, dfsan_label label); // Please see dfsan.cpp for actual definition
 
 // inline dfsan_label *shadow_for(void *ptr) {
-//   return (dfsan_label *) ((((uptr) ptr) & ShadowMask()) << 2);
+  // return (dfsan_label *) ((((uptr) ptr) & ShadowMask()) << 2);
 // }
 
 inline const dfsan_label *shadow_for(const void *ptr) {

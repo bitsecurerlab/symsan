@@ -71,13 +71,13 @@ typedef void (*dfsan_write_callback_t)(int fd, const void *buf, size_t count);
 /// the process.
 //dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u8 op, u8 size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
-                        u64 op1, u64 op2);
+                        u64 op1, u64 op2, u64 pc);
 
 /// Creates and returns a base label with the given description and user data.
 dfsan_label dfsan_create_label(int pos);
   
 /// Sets the label for each address in [addr,addr+size) to \c label.
-void dfsan_set_label(dfsan_label label, void *addr, size_t size);
+void dfsan_set_label(dfsan_label label, void *addr, size_t size, u64 pc);
 
 /// Sets the label for each address in [addr,addr+size) to the union of the
 /// current label for that address and \c label.
@@ -94,7 +94,7 @@ dfsan_label dfsan_get_label(long data);
 /// Retrieves the label associated with the data at the given address.
 dfsan_label dfsan_read_label(const void *addr, size_t size);
 
-void dfsan_store_label(dfsan_label l, void *addr, size_t size);
+void dfsan_store_label(dfsan_label l, void *addr, size_t size, u64 pc);
 
 /// Returns non-zero when every byte in [addr, addr + size) is concrete.
 int dfsan_region_is_concrete(const void *addr, size_t size);

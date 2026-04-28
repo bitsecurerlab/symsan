@@ -38,6 +38,7 @@ add_compiler_rt_component(dfsan)
 foreach(arch ${DFSAN_SUPPORTED_ARCH})
   set(DFSAN_CFLAGS ${DFSAN_COMMON_CFLAGS})
   append_list_if(COMPILER_RT_HAS_FPIE_FLAG -fPIE DFSAN_CFLAGS)
+  list(APPEND DFSAN_CFLAGS -isystem /usr/lib/llvm-12/include/c++/v1)
   add_compiler_rt_runtime(dfsan_rt
     STATIC
     ARCHS ${arch}
@@ -56,6 +57,8 @@ foreach(arch ${DFSAN_SUPPORTED_ARCH})
   if(OS_NAME MATCHES "Linux" AND
     COMPILER_RT_LIBCXX_PATH AND
     COMPILER_RT_LIBCXXABI_PATH)
+    set_source_files_properties(dfsan.cpp PROPERTIES
+      COMPILE_FLAGS "-isystem /usr/include/c++/9 -isystem /usr/include/x86_64-linux-gnu/c++/9")
     macro(partially_link_libcxx name dir arch)
       set(cxx_${arch}_merge_dir "${CMAKE_CURRENT_BINARY_DIR}/cxx_${arch}_merge.dir")
       file(MAKE_DIRECTORY ${cxx_${arch}_merge_dir})

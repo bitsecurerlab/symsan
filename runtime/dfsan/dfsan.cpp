@@ -18,6 +18,10 @@
 // prefixed __dfsan_.
 //===----------------------------------------------------------------------===//
 
+// Suppress redeclaration warnings — definitions below match dfsan.h declarations
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wredundant-decls"
+
 #include "sanitizer_common/sanitizer_atomic.h"
 #include "sanitizer_common/sanitizer_common.h"
 #include "sanitizer_common/sanitizer_file.h"
@@ -41,8 +45,13 @@
 #include <sys/types.h>
 #include <assert.h>
 #include <fcntl.h>
+#include <map>
+//#include <algorithm>
+//#include <string> // For op-to-string conversion
 
 std::map<uintptr_t, dfsan_label *> g_shadow_pages;
+extern "C" void telemetry_send(const char *json);
+extern "C" char telemetry_enabled;
 
 using namespace __dfsan;
 
@@ -130,6 +139,181 @@ static void dfsan_check_label(dfsan_label label) {
   }
 }
 
+dfsan_label *shadow_for(void *ptr) {
+    auto shadowPageIt = g_shadow_pages.find(pageStart(ptr));
+            if (shadowPageIt != g_shadow_pages.end()) {
+        return shadowPageIt->second + pageOffset(ptr);
+    }
+    return nullptr;
+}
+
+dfsan_label *getOrCreateShadow(void *ptr, dfsan_label l) {
+    if (auto *shadow = shadow_for(ptr))
+        return shadow;
+    if (l == 0)
+        return nullptr;
+    auto *newShadow =
+        static_cast<dfsan_label *>(malloc(kPageSize * sizeof(dfsan_label)));
+    memset(newShadow, 0, kPageSize * sizeof(dfsan_label));
+    g_shadow_pages[pageStart(ptr)] = newShadow;
+    return newShadow + pageOffset(ptr);
+}
+
+/**** Gemini op decoding, Claude constraint printing code ****/
+static char unknown_op_buf[32];
+static char unknown_pred_buf[32];
+
+const char* get_predicate_name(u64 pred) { // This should probably be a u8, it doesn't need to be a u64...
+    switch (pred) {
+    case 0:     return "ICmp"; // Default case; for no predicate
+    case bveq:  return "==";
+    case bvneq: return "!=";
+    case bvugt: return ">u";
+    case bvult: return "<u";
+    case bvuge: return ">=u";
+    case bvule: return "<=u";
+    case bvsgt: return ">s";
+    case bvslt: return "<s";
+    case bvsge: return ">=s";
+    case bvsle: return "<=s";
+    default:
+      __sanitizer::internal_snprintf(unknown_pred_buf, sizeof(unknown_pred_buf), "pred_%d", (int)pred);
+      return unknown_pred_buf;
+    }
+}
+
+const char* get_op_name(u16 op, u64 pred) {
+    // 1. Handle custom DFSan operators first
+    switch (op) {
+        case 28:    return get_predicate_name(pred); // ICmp
+        case 1:     return "Not"; // Not
+        case 2:     return "Neg"; // Neg
+        case Extract: return "Extract";
+        case Concat:  return "Concat";
+        case Ite:     return "If-Then-Else";
+        //case Equal:   return "Equal"; // This opcode was eliminated from this branch
+        case fmemcmp: return "memcmp_func";
+        case Arg:     return "Function_Arg";
+    }
+
+    // 2. Handle LLVM Instructions using macro expansion
+    // This maps the 'num' from Instruction.def to a string
+    switch (op) {
+#define HANDLE_BINARY_INST(num, opcode, Class) case num: return #opcode;
+#define HANDLE_MEMORY_INST(num, opcode, Class) case num: return #opcode;
+#define HANDLE_CAST_INST(num, opcode, Class)   case num: return #opcode;
+#define HANDLE_OTHER_INST(num, opcode, Class)  case num: return #opcode;
+#include "llvm/IR/Instruction.def"
+#undef HANDLE_BINARY_INST
+#undef HANDLE_MEMORY_INST
+#undef HANDLE_CAST_INST
+#undef HANDLE_OTHER_INST
+    }
+    __sanitizer::internal_snprintf(unknown_op_buf, sizeof(unknown_op_buf), "Unknown_Op(%d)", op);
+    return unknown_op_buf;
+    //return "Unknown_Op (" + std::to_string(op) + ")";
+}
+
+static void print_constraint_recursive_readable(dfsan_label label, int depth) {
+    if (label == 0) {
+        printf("%*s<concrete>\n", depth * 2, "");
+        return;
+    }
+
+    dfsan_label_info *info = get_label_info(label);
+    if (!info) return;
+
+    const char *op_str = get_op_name(info->op, 0);
+
+    // Special handling for common patterns
+    if (info->op == Concat && depth == 0) {
+        printf("%*s(Building multi-byte value from symbolic bytes)\n", depth * 2, "");
+    } else if (info->op == ZExt) {
+        printf("%*sZero-extend to %u bits:\n", depth * 2, "", info->size);
+    } else if (info->op == Extract) {
+        printf("%*sExtract bits [%llu:%llu]:\n", depth * 2, "", info->op1.i, info->op2.i);
+    } else if (info->op == Mul && (info->op1.i == 0x2c || info->op2.i == 0x2c)) {
+        printf("%*s(symbolic * 44) [calculating array size]:\n", depth * 2, "");
+    } else if (info->op == Add && info->op1.i == 0xffffffff) {
+        printf("%*s(value - 1):\n", depth * 2, "");
+    } else {
+        printf("%*s%s (size=%u):\n", depth * 2, "", op_str, info->size);
+        if (info->op1.i || info->op2.i) {
+            printf("%*s  constants: %llu, %llu\n", depth * 2, "", info->op1.i, info->op2.i);
+        }
+    }
+
+    if (info->l1) print_constraint_recursive_readable(info->l1, depth + 1);
+    if (info->l2) print_constraint_recursive_readable(info->l2, depth + 1);
+}
+
+extern "C" void print_constraint(dfsan_label label) {
+    printf("=== Human-readable constraint for Label %u ===\n", label);
+    print_constraint_recursive_readable(label, 0);
+    printf("=============================================\n");
+}
+
+/**** print_constraint() is old and pending deletion ****/
+
+// In dfsan.cpp
+
+// Branch constraint structure
+struct branch_constraint_t {
+    u64 pc;
+    dfsan_label label;
+    u64 actual_value;
+    u8 operation;
+    u64 compared_to;
+    bool result;
+};
+
+// Operation encoding
+enum constraint_op {
+    OP_EQUAL = 0,
+    OP_NOT_EQUAL = 1,
+    OP_LESS = 2,
+    OP_LESS_EQUAL = 3,
+    OP_GREATER = 4,
+    OP_GREATER_EQUAL = 5,
+    OP_SLESS = 6,
+    OP_SLESS_EQUAL = 7,
+    OP_SGREATER = 8,
+    OP_SGREATER_EQUAL = 9
+};
+
+static const char* op_to_string(u8 op) {
+    switch (op) {
+        case OP_EQUAL: return "==";
+        case OP_NOT_EQUAL: return "!=";
+        case OP_LESS: return "<";
+        case OP_LESS_EQUAL: return "<=";
+        case OP_GREATER: return ">";
+        case OP_GREATER_EQUAL: return ">=";
+        case OP_SLESS: return "<s";
+        case OP_SLESS_EQUAL: return "<=s";
+        case OP_SGREATER: return ">s";
+        case OP_SGREATER_EQUAL: return ">=s";
+        default: return "?";
+    }
+}
+
+static u8 string_to_op(const char* str) {
+    if (internal_strcmp(str, "==") == 0) return OP_EQUAL;
+    if (internal_strcmp(str, "!=") == 0) return OP_NOT_EQUAL;
+    if (internal_strcmp(str, "<") == 0) return OP_LESS;
+    if (internal_strcmp(str, "<=") == 0) return OP_LESS_EQUAL;
+    if (internal_strcmp(str, ">") == 0) return OP_GREATER;
+    if (internal_strcmp(str, ">=") == 0) return OP_GREATER_EQUAL;
+    if (internal_strcmp(str, "<s") == 0) return OP_SLESS;
+    if (internal_strcmp(str, "<=s") == 0) return OP_SLESS_EQUAL;
+    if (internal_strcmp(str, ">s") == 0) return OP_SGREATER;
+    if (internal_strcmp(str, ">=s") == 0) return OP_SGREATER_EQUAL;
+    return OP_EQUAL;
+}
+
+/**** End LLM code ****/
+
+
 // based on https://github.com/Cyan4973/xxHash
 // simplified since we only have 12 bytes info
 static inline u32 xxhash(u32 h1, u32 h2, u32 h3) {
@@ -180,8 +364,9 @@ int dfsan_concrete_page(void *addr) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
-                          u64 op1, u64 op2) {
+dfsan_label
+__taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
+                          u64 op1, u64 op2, u64 pc) {
   if (l1 > l2 && is_commutative(op)) {
     // needs to swap both labels and concretes
     Swap(l1, l2);
@@ -213,7 +398,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
 
   struct dfsan_label_info label_info = {
     .l1 = l1, .l2 = l2, .op1 = op1, .op2 = op2, .op = op, .size = size,
-    .hash = hash};
+    .hash = hash, .pc = pc};
 
   __taint::option res = __union_table.lookup(label_info);
   if (res != __taint::none()) {
@@ -222,6 +407,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
     return label;
   }
   // for debugging
+  
   dfsan_label l = atomic_load(&__dfsan_last_label, memory_order_relaxed);
   assert(l1 <= l && l2 <= l);
 
@@ -230,8 +416,49 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
   dfsan_check_label(label);
   assert(label > l1 && label > l2);
 
-  AOUT("%u = (%u, %u, %u, %u, %llu, %llu)\n", label, l1, l2, op, size, op1, op2);
-
+  const char* op_name = get_op_name(op & 0xff, (op >> 8));
+  //AOUT("%u = (%u, %u, %u, %u, %llu, %llu)\n", label, l1, l2, op, size, op1, op2);
+  AOUT("%u = (%u, %u, %s, %u, %llu, %llu, 0x%llx)\n", label, l1, l2, op_name, size, op1, op2, pc);
+  if (telemetry_enabled) {
+      char jsonbuffer[956];
+      char label_summary[256];
+      u16 op_base = op & 0xff;  // strip predicate from upper byte
+      if (op_base == Extract) {
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = Extract bits [%llu:%llu] of label %u at PC 0x%llx",
+            label, op1, op2, l1, pc);
+    } else if (op_base == Concat) {
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = Concat label %u (val=%llu) : label %u (val=%llu, size=%u) at PC 0x%llx",
+            label, l1, op1, l2, op2, size, pc);
+    } else if (l2 == 0) {
+        // Unary operation
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = %s label %u (val=%llu, size=%u) at PC 0x%llx",
+            label, op_name, l1, op1, size, pc);
+    } else {
+        // Binary operation
+        internal_snprintf(label_summary, sizeof(label_summary) - 1,
+            "label %u = label %u (val=%llu) %s label %u (val=%llu, size=%u) at PC 0x%llx",
+            label, l1, op1, op_name, l2, op2, size, pc);
+    }
+    internal_snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+          "{"
+          "\"source\": \"dfsan\","
+          "\"trigger\": \"label_creation\","
+          "\"label_summary\": \"%s\","
+          "\"label\": %u,"
+          "\"l1\": %u,"
+          "\"l2\": %u,"
+          "\"op\": \"%s\","
+          "\"size\": %u,"
+          "\"op1\": %llu,"
+          "\"op2\": %llu,"
+          "\"pc\": \"0x%llx\""
+          "}",
+          label_summary, label, l1, l2, op_name, size, op1, op2, pc);
+      telemetry_send(jsonbuffer);
+  }
   internal_memcpy(&__dfsan_label_info[label], &label_info, sizeof(dfsan_label_info));
   __union_table.insert(&__dfsan_label_info[label], label);
   return label;
@@ -306,17 +533,17 @@ dfsan_label __taint_union_load(const dfsan_label *ls, const void *addr, uptr n) 
     // if (n == 1) return label0;
     if (n == 1) {
       assert(get_label_info(label0)->size == 8);
-      return __taint_union(label0, CONST_LABEL, ZExt, 64, 0, 0);
+      return __taint_union(label0, CONST_LABEL, ZExt, 64, 0, 0, __dfsan_label_info[label0].pc);
     }
 
-    AOUT("shape: label0: %d %d shadow addr: %p\n", label0, n, ls);
+    AOUT("shape: label0: %d %d shadow addr: %p app_for %p\n", label0, n, ls, app_for(ls));
     // return __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
     if (n == 8) {
-      return __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
+      return __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0, __dfsan_label_info[label0].pc);
     } else {
       // symqemu: extend label to 64-bit
-      dfsan_label out = __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0);
-      return __taint_union(out, CONST_LABEL, ZExt, 64, 0, 0);
+      dfsan_label out = __taint_union(label0, (dfsan_label)n, Load, n * 8, 0, 0, __dfsan_label_info[label0].pc);
+      return __taint_union(out, CONST_LABEL, ZExt, 64, 0, 0, __dfsan_label_info[label0].pc);
     }
   }
 
@@ -367,12 +594,12 @@ dfsan_label __taint_union_load(const dfsan_label *ls, const void *addr, uptr n) 
       if (next_size <= 64) {
         // i += next_size / 8;
         i += 1;
-        label = __taint_union(label, next_label, Concat, i * 8, 0, 0);
+        label = __taint_union(label, next_label, Concat, i * 8, 0, 0, __dfsan_label_info[label0].pc);
       } else {
         Report("WARNING: partial loading expected=%d has=%d\n", n-i, next_size);
         uptr size = n - i;
-        dfsan_label trunc = __taint_union(next_label, CONST_LABEL, Trunc, size * 8, 0, 0);
-        return __taint_union(label, trunc, Concat, n * 8, 0, 0);
+        dfsan_label trunc = __taint_union(next_label, CONST_LABEL, Trunc, size * 8, 0, 0, __dfsan_label_info[label0].pc);
+        return __taint_union(label, trunc, Concat, n * 8, 0, 0, __dfsan_label_info[label0].pc); // Which PC value should we be using here? label0?
       }
     } else {
       // Report("WARNING: taint mixed with concrete %d %p\n", i, &ls[i]);
@@ -380,16 +607,16 @@ dfsan_label __taint_union_load(const dfsan_label *ls, const void *addr, uptr n) 
       // char *c = (char *)app_for(&ls[i]);
       ++i;
       // label = __taint_union(label, 0, Concat, i * 8, 0, *c);
-      label = __taint_union(label, 0, Concat, i * 8, 0, 0);
+      label = __taint_union(label, 0, Concat, i * 8, 0, 0, __dfsan_label_info[label0].pc);
     }
   }
   AOUT("\n");
-  label = __taint_union(label, CONST_LABEL, ZExt, 64, 0, 0);
+  label = __taint_union(label, CONST_LABEL, ZExt, 64, 0, 0, __dfsan_label_info[label0].pc);
   return label;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __taint_union_store(dfsan_label l, dfsan_label *ls, const void *addr, uptr n) {
+void __taint_union_store(dfsan_label l, dfsan_label *ls, const void *addr, uptr n, u64 pc) {
   // AOUT("label = %d, n = %d, ls = %p\n", l, n, ls);
   // TODO: add concrete page check
   uptr pos = 0;
@@ -460,9 +687,9 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, const void *addr, uptr 
   for (uptr i = 0; i < n; ++i) {
     if (next_ls && i >= pos) {
       assert(pos != 0);
-      next_ls[i - pos] = __taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
+      next_ls[i - pos] = __taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8, pc); // TO DO: Is the PC value for this sane?
     } else {
-      ls[i] = __taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
+      ls[i] = __taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8, pc);
     }
     // ls[i] = __taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
   }
@@ -527,13 +754,14 @@ void __taint_check_bounds(dfsan_label l, uptr addr) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void dfsan_store_label(dfsan_label l, void *addr, uptr size) {
+void dfsan_store_label(dfsan_label l, void *addr, uptr size, u64 pc) {
   // This check is wrong. Removed.
   // if (l == 0) return;
   // __taint_union_store(l, shadow_for(addr), size);
   dfsan_label *ls = getOrCreateShadow(addr, l);
   if (ls == nullptr) return;
-  __taint_union_store(l, ls, addr, size);
+  AOUT("Storing label %d with address %p, size %d, pc 0x%llx\n", l, addr, size, pc);
+  __taint_union_store(l, ls, addr, size, pc);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -570,8 +798,8 @@ __dfsan_vararg_wrapper(const char *fname) {
 // Like __dfsan_union, but for use from the client or custom functions.  Hence
 // the equality comparison is done here before calling __dfsan_union.
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size, u64 op1, u64 op2) {
-  return __taint_union(l1, l2, op, size, op1, op2);
+dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size, u64 op1, u64 op2, u64 pc) {
+  return __taint_union(l1, l2, op, size, op1, op2, pc);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
@@ -589,7 +817,7 @@ dfsan_label dfsan_create_label(off_t offset) {
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
-void __dfsan_set_label(dfsan_label label, void *addr, uptr size) {
+void __dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc) {
   for (dfsan_label *labelp = getOrCreateShadow(addr, label); size != 0; --size, ++labelp) {
     if (labelp == nullptr && label == 0) break;
     // Don't write the label if it is already the value we need it to be.
@@ -602,21 +830,34 @@ void __dfsan_set_label(dfsan_label label, void *addr, uptr size) {
     // the amount of real memory used by large programs.
     if (label == *labelp)
       continue;
-
-    AOUT("set label %p = %u, label size %d shadow addr: %p\n", addr, label, get_label_info(label)->size, shadow_for(addr));
+    if (telemetry_enabled) {
+      char jsonbuffer[500];
+      snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+          "{"
+          "\"source\": \"dfsan\","
+          "\"trigger\": \"taint_introduction\","
+          "\"address\": \"0x%lx\","
+          "\"label\": %u,"
+          "\"label_size\": %d,"
+          "\"pc\": \"0x%llx\""
+          "}",
+          (unsigned long)addr, label, get_label_info(label)->size, pc);
+      telemetry_send(jsonbuffer);
+    }
+    AOUT("set label %p = %u, label size %d shadow addr: %p, pc 0x%llx\n", addr, label, get_label_info(label)->size, shadow_for(addr), pc);
     *labelp = label;
   }
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-void dfsan_set_label(dfsan_label label, void *addr, uptr size) {
-  __dfsan_set_label(label, addr, size);
+void dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc) {
+  __dfsan_set_label(label, addr, size, pc);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
-void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size) {
+void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size, u64 pc) {
   for (dfsan_label *labelp = shadow_for(addr); size != 0; --size, ++labelp)
-    *labelp = __taint_union(*labelp, label, op, 1, 0, 0);
+    *labelp = __taint_union(*labelp, label, op, 1, 0, 0, pc);
 }
 
 // Unlike the other dfsan interface functions the behavior of this function
@@ -693,7 +934,7 @@ dfsan_has_label(dfsan_label label, dfsan_label elem) {
   }
   if (info->l2 != 0) {
     return dfsan_has_label(info->l2, elem);
-  } 
+  }
   return false;
 }
 
@@ -709,12 +950,12 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 dfsan_dump_labels(int fd) {
   dfsan_label last_label =
       atomic_load(&__dfsan_last_label, memory_order_relaxed);
-
   for (uptr l = 1; l <= last_label; ++l) {
     char buf[64];
-    internal_snprintf(buf, sizeof(buf), "%u (%u %u %u %u)", l,
+    internal_snprintf(buf, sizeof(buf), "%u (%u %u %u %u 0x%llx)", l,
                       __dfsan_label_info[l].l1, __dfsan_label_info[l].l2,
-                      __dfsan_label_info[l].op, __dfsan_label_info[l].size);
+                      __dfsan_label_info[l].op, __dfsan_label_info[l].size, __dfsan_label_info[l].pc);
+    AOUT("fd:%d writing to file: %s\n", fd, buf);
     WriteToFile(fd, buf, internal_strlen(buf));
     WriteToFile(fd, "\n", 1);
   }
@@ -819,17 +1060,17 @@ static void InitializeTaintFile() {
   if (internal_strcmp(filename, "stdin") == 0) {
     tainted.fd = 0;
     // try to get the size, as stdin may be a file
-    if (!fstat(0, &st)) {
-      tainted.size = st.st_size;
-      tainted.is_stdin = 0;
-      // map a copy
-      tainted.buf_size = RoundUpTo(st.st_size, GetPageSizeCached());
-      uptr map = internal_mmap(nullptr, tainted.buf_size, PROT_READ, MAP_PRIVATE, 0, 0);
-      if (internal_iserror(map)) {
-        Printf("FATAL: failed to map a copy of input file\n");
-        Die();
-      }
-      tainted.buf = reinterpret_cast<char *>(map);
+    if (!fstat(0, &st) && st.st_size > 0) {
+        tainted.size = st.st_size;
+        tainted.is_stdin = 0;
+        // map a copy
+        tainted.buf_size = RoundUpTo(st.st_size, GetPageSizeCached());
+        uptr map = internal_mmap(nullptr, tainted.buf_size, PROT_READ, MAP_PRIVATE, 0, 0);
+        if (internal_iserror(map)) {
+            Printf("FATAL: failed to map a copy of input file\n");
+            Die();
+        }
+    tainted.buf = reinterpret_cast<char *>(map);
     } else {
       tainted.size = 1;
       tainted.is_stdin = 1; // truly stdin
@@ -984,7 +1225,7 @@ static inline dfsan_label get_label_for(int fd, off_t offset) {
     } else {
       return (offset + CONST_OFFSET);
     }
-  } 
+  }
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE int
@@ -1001,10 +1242,12 @@ __dfsan_read(int fd, void *buf, size_t count, size_t *isSymbolicPage) {
   off_t offset = lseek(fd, 0, SEEK_CUR);
   ssize_t ret = read(fd, buf, count);
   if (ret >= 0) {
+    dfsan_label label;
     if (taint_get_file(fd)) {
       AOUT("offset = %d, ret = %d, count = %d\n", offset, ret, count);
       for(ssize_t i = 0; i < ret; i++) {
-        dfsan_set_label(get_label_for(fd, offset + i), (char *)buf + i, 1);
+        label = get_label_for(fd, offset + i);
+        dfsan_set_label(label, (char *)buf + i, 1, get_label_info(label)->pc);
       }
       *isSymbolicPage = 1;
       // for (size_t i = ret; i < count; i++)
@@ -1118,13 +1361,81 @@ SANITIZER_INTERFACE_WEAK_DEF(dfsan_label, __taint_trace_cmp, dfsan_label op1,
     return 0;
 
   void *addr = __builtin_return_address(0);
+  unsigned char result = get_const_result(c1, c2, predicate);
+
+  if (telemetry_enabled) {
+      // Build natural language summary first for LLM/JSON transmission
+      char summary[256];
+      const char * predicate_name = get_predicate_name(predicate); // Since we're using this twice, should we get this once unconditionally?
+      if (op1 != 0 && op2 == 0) {
+          snprintf(summary, sizeof(summary) - 1,
+              "%llu (label %u) %s %llu (constant) at PC 0x%llx, result: %s",
+              c1, op1, predicate_name, c2, cid, result ? "taken" : "not taken");
+      } else if (op1 == 0 && op2 != 0) {
+          snprintf(summary, sizeof(summary) - 1,
+              "%llu (constant) %s %llu (label %u) at PC 0x%llx, result: %s",
+              c1, predicate_name, c2, op2, cid, result ? "taken" : "not taken");
+      } else {
+          snprintf(summary, sizeof(summary) - 1,
+              "%llu (label %u) %s %llu (label %u) at PC 0x%llx, result: %s",
+              c1, op1, predicate_name, c2, op2, cid, result ? "taken" : "not taken");
+      }
+      char jsonbuffer[1280];
+      snprintf(jsonbuffer, sizeof(jsonbuffer) - 1,
+          "{"
+          "\"source\": \"dfsan\","
+          "\"trigger\": \"branch_eval\","
+          "\"summary\": \"%s\","
+          "\"pc\": \"0x%llx\","
+          "\"predicate\": \"%s\","
+          "\"op1_symbolic\": %s,"
+          "\"op1_label\": %u,"
+          "\"op1_val\": %llu,"
+          "\"op2_symbolic\": %s,"
+          "\"op2_label\": %u,"
+          "\"op2_val\": %llu,"
+          "\"result\": %d"
+          "}",
+          summary, cid, predicate_name,
+          (op1 != 0) ? "true" : "false", op1, c1,
+          (op2 != 0) ? "true" : "false", op2, c2,
+          (int)result);
+      telemetry_send(jsonbuffer);
+  }
+
+    // Enhanced logging with concrete values via Claude. Erase/etc as necessary
+    if (print_debug) {
+        const char * pred_name = get_predicate_name(predicate);
+        fprintf(stderr, "[BRANCH] PC=0x%llx: ", cid);
+
+        if (op1 != 0 && op2 == 0) {
+            fprintf(stderr, "symbolic(label=%u, val=%llu) %s constant(%llu), result=%llu\n",
+                    op1, c1, pred_name, c2, result);
+        } else if (op1 == 0 && op2 != 0) {
+            fprintf(stderr, "constant(%llu) %s symbolic(label=%u, val=%llu), result=%llu\n",
+                    c1, pred_name, op2, c2, result);
+        } else {
+            fprintf(stderr, "symbolic(label=%u, val=%llu) %s symbolic(label=%u, val=%llu), result=%llu\n",
+                    op1, c1, pred_name, op2, c2, result);
+        }
+
+        // Optionally print full expressions
+        //if (g_print_expressions) {
+            if (op1 != 0) {
+                fprintf(stderr, "  [EXPR_OP1] label=%u: ", op1);
+            }
+            if (op2 != 0) {
+                fprintf(stderr, "  [EXPR_OP2] label=%u: ", op2);
+            }
+        //}
+    }
 
   AOUT("solving cmp: %u %u %u %d %llu %llu 0x%x @%p\n",
        op1, op2, size, predicate, c1, c2, cid, addr);
 
   // save info to a union table slot
   u8 r = get_const_result(c1, c2, predicate);
-  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
+  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2, cid);
 
   // add nested only for matching cases
   __solve_cond(temp, r, r, cid, addr);

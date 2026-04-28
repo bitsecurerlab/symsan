@@ -80,7 +80,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, u32 size, u32 predicate,
 
   // save info to a union table slot
   u8 r = get_const_result(c1, c2, predicate);
-  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
+  dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2, cid);
 
   // add nested only for matching cases
   __solve_cond(temp, r, r, cid, addr);
