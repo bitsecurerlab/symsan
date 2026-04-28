@@ -139,7 +139,7 @@ static void dfsan_check_label(dfsan_label label) {
   }
 }
 
-dfsan_label *shadow_for(void *ptr) {
+dfsan_label *__dfsan::shadow_for(void *ptr) {
     auto shadowPageIt = g_shadow_pages.find(pageStart(ptr));
             if (shadowPageIt != g_shadow_pages.end()) {
         return shadowPageIt->second + pageOffset(ptr);
@@ -870,11 +870,17 @@ __dfsw_dfsan_get_label(long data, dfsan_label data_label,
   return data_label;
 }
 
-SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-dfsan_read_label(const void *addr, uptr size) {
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+__attribute__((no_sanitize("dataflow"), noinline)) dfsan_label
+symsan_read_label_raw(const void *addr, uptr size) {
   if (size == 0)
     return 0;
-  return __taint_union_load(shadow_for(addr), addr, size);
+  return __taint_union_load(shadow_for(const_cast<void *>(addr)), addr, size);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
+dfsan_read_label(const void *addr, uptr size) {
+  return symsan_read_label_raw(addr, size);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
@@ -882,14 +888,15 @@ dfsan_get_label(const void *addr) {
   return *shadow_for(addr);
 }
 
-SANITIZER_INTERFACE_ATTRIBUTE int
-dfsan_region_is_concrete(const void *addr, uptr size) {
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+__attribute__((no_sanitize("dataflow"), noinline)) int
+symsan_region_is_concrete_raw(const void *addr, uptr size) {
   const u8 *cursor = reinterpret_cast<const u8 *>(addr);
   uptr remaining = size;
 
   while (remaining > 0) {
     uptr page_bytes = Min(kPageSize - pageOffset(const_cast<u8 *>(cursor)), remaining);
-    const dfsan_label *shadow = shadow_for(cursor);
+    const dfsan_label *shadow = shadow_for(const_cast<u8 *>(cursor));
 
     if (shadow != nullptr) {
       for (uptr i = 0; i < page_bytes; ++i) {
@@ -904,6 +911,11 @@ dfsan_region_is_concrete(const void *addr, uptr size) {
   }
 
   return 1;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+dfsan_region_is_concrete(const void *addr, uptr size) {
+  return symsan_region_is_concrete_raw(addr, size);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE

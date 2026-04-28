@@ -76,8 +76,10 @@ extern "C" {
 void dfsan_add_label(dfsan_label label, u8 op, void *addr, uptr size, u64 pc);
 void dfsan_set_label(dfsan_label label, void *addr, uptr size, u64 pc);
 dfsan_label dfsan_read_label(const void *addr, uptr size);
+dfsan_label symsan_read_label_raw(const void *addr, uptr size);
 void dfsan_store_label(dfsan_label l1, void *addr, uptr size, u64 pc);
 int dfsan_region_is_concrete(const void *addr, uptr size);
+int symsan_region_is_concrete_raw(const void *addr, uptr size);
 dfsan_label dfsan_union(dfsan_label l1, dfsan_label l2, u16 op, u16 size,
                         u64 op1, u64 op2, u64 pc);
 dfsan_label dfsan_create_label(off_t offset);
@@ -131,7 +133,7 @@ inline const uintptr_t pageOffset(void *addr) {
   return ((uintptr_t)addr & (kPageSize - 1));
 }
 
-//dfsan_label *shadow_for(void *ptr);
+dfsan_label *shadow_for(void *ptr);
 
 /*
 inline dfsan_label *getOrCreateShadow(void *ptr, dfsan_label l) {
