@@ -635,6 +635,20 @@ static z3::expr serialize(dfsan_label label, std::unordered_set<u32> &deps,
   } else if (info->op == IntToPtr) {
     z3::expr e = serialize(info->l1, deps, mode);
     return cache_expr(label, e, deps, mode);
+  } else if (info->op == Ite) {
+    z3::expr cond = serialize(info->l1, deps, mode);
+    if (!cond.is_bool()) {
+      if (!cond.is_bv()) {
+        throw z3::exception("invalid Ite condition");
+      }
+      cond = cond != __z3_context.bv_val(0, cond.get_sort().bv_size());
+    }
+    tsize_cache[label] = tsize_cache[info->l1]; // lazy init
+    return cache_expr(label,
+                      z3::ite(cond,
+                              __z3_context.bv_val(1, info->size),
+                              __z3_context.bv_val(0, info->size)),
+                      deps, mode);
   }
   // higher-order
   else if (info->op == fmemcmp) {
