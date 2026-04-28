@@ -872,15 +872,10 @@ __dfsw_dfsan_get_label(long data, dfsan_label data_label,
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 __attribute__((no_sanitize("dataflow"), noinline)) dfsan_label
-symsan_read_label_raw(const void *addr, uptr size) {
+dfsan_read_label(const void *addr, uptr size) {
   if (size == 0)
     return 0;
   return __taint_union_load(shadow_for(const_cast<void *>(addr)), addr, size);
-}
-
-SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
-dfsan_read_label(const void *addr, uptr size) {
-  return symsan_read_label_raw(addr, size);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE dfsan_label
@@ -890,7 +885,7 @@ dfsan_get_label(const void *addr) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 __attribute__((no_sanitize("dataflow"), noinline)) int
-symsan_region_is_concrete_raw(const void *addr, uptr size) {
+dfsan_region_is_concrete(const void *addr, uptr size) {
   const u8 *cursor = reinterpret_cast<const u8 *>(addr);
   uptr remaining = size;
 
@@ -911,11 +906,6 @@ symsan_region_is_concrete_raw(const void *addr, uptr size) {
   }
 
   return 1;
-}
-
-SANITIZER_INTERFACE_ATTRIBUTE int
-dfsan_region_is_concrete(const void *addr, uptr size) {
-  return symsan_region_is_concrete_raw(addr, size);
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE

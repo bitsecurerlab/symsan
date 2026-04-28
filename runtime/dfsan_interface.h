@@ -93,13 +93,11 @@ dfsan_label dfsan_get_label(long data);
 
 /// Retrieves the label associated with the data at the given address.
 dfsan_label dfsan_read_label(const void *addr, size_t size);
-dfsan_label symsan_read_label_raw(const void *addr, size_t size);
 
 void dfsan_store_label(dfsan_label l, void *addr, size_t size, u64 pc);
 
 /// Returns non-zero when every byte in [addr, addr + size) is concrete.
 int dfsan_region_is_concrete(const void *addr, size_t size);
-int symsan_region_is_concrete_raw(const void *addr, size_t size);
 
 /// Retrieves the starting address for the shadow memory of the given address
 const dfsan_label * dfsan_shadow_for(const void * addr);
