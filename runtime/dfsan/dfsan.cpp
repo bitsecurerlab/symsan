@@ -1254,7 +1254,7 @@ __dfsan_read(int fd, void *buf, size_t count, size_t *isSymbolicPage) {
       //   dfsan_set_label(-1, (char *)buf + i, 1);
       // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
     } else {
-      dfsan_set_label(0, buf, ret);
+      dfsan_set_label(0, buf, ret, 0);
       *isSymbolicPage = 0;
     }
   }

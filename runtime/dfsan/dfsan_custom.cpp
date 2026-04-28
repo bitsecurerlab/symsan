@@ -82,7 +82,7 @@ __dfsw_stat(const char *path, struct stat *buf, dfsan_label path_label,
   // To get a valid guest PC value called in, what would need to be instrumented?
   int ret = stat(path, buf);
   if (ret == 0) {
-    dfsan_set_label(0, buf, sizeof(struct stat));
+    dfsan_set_label(0, buf, sizeof(struct stat), pc);
     dfsan_label size = dfsan_union(0, 0, fsize, sizeof(buf->st_size) * 8, 0, 0, pc);
     dfsan_set_label(size, &buf->st_size, sizeof(buf->st_size), pc);
   }
@@ -609,7 +609,7 @@ char *__dfsw_getcwd(char *buf, size_t size, dfsan_label buf_label,
                     dfsan_label size_label, dfsan_label *ret_label) {
   char *ret = getcwd(buf, size);
   if (ret) {
-    dfsan_set_label(0, ret, strlen(ret) + 1);
+    dfsan_set_label(0, ret, strlen(ret) + 1, 0);
     *ret_label = buf_label;
   } else {
     *ret_label = 0;
@@ -621,7 +621,7 @@ SANITIZER_INTERFACE_ATTRIBUTE
 char *__dfsw_get_current_dir_name(dfsan_label *ret_label) {
   char *ret = get_current_dir_name();
   if (ret) {
-    dfsan_set_label(0, ret, strlen(ret) + 1);
+    dfsan_set_label(0, ret, strlen(ret) + 1, 0);
   }
   *ret_label = 0;
   return ret;
@@ -632,7 +632,7 @@ int __dfsw_gethostname(char *name, size_t len, dfsan_label name_label,
                        dfsan_label len_label, dfsan_label *ret_label) {
   int ret = gethostname(name, len);
   if (ret == 0) {
-    dfsan_set_label(0, name, strlen(name) + 1);
+    dfsan_set_label(0, name, strlen(name) + 1, 0);
   }
   *ret_label = 0;
   return ret;
@@ -644,7 +644,7 @@ int __dfsw_getrlimit(int resource, struct rlimit *rlim,
                      dfsan_label *ret_label) {
   int ret = getrlimit(resource, rlim);
   if (ret == 0) {
-    dfsan_set_label(0, rlim, sizeof(struct rlimit));
+    dfsan_set_label(0, rlim, sizeof(struct rlimit), 0);
   }
   *ret_label = 0;
   return ret;
@@ -655,7 +655,7 @@ int __dfsw_getrusage(int who, struct rusage *usage, dfsan_label who_label,
                      dfsan_label usage_label, dfsan_label *ret_label) {
   int ret = getrusage(who, usage);
   if (ret == 0) {
-    dfsan_set_label(0, usage, sizeof(struct rusage));
+    dfsan_set_label(0, usage, sizeof(struct rusage), 0);
   }
   *ret_label = 0;
   return ret;
@@ -756,7 +756,7 @@ SANITIZER_INTERFACE_ATTRIBUTE
 time_t __dfsw_time(time_t *t, dfsan_label t_label, dfsan_label *ret_label) {
   time_t ret = time(t);
   if (ret != (time_t) -1 && t) {
-    dfsan_set_label(0, t, sizeof(time_t));
+    dfsan_set_label(0, t, sizeof(time_t), 0);
   }
   *ret_label = 0;
   return ret;
@@ -782,7 +782,7 @@ struct tm *__dfsw_localtime_r(const time_t *timep, struct tm *result,
   struct tm *ret = localtime_r(timep, result);
   if (ret) {
     dfsan_set_label(dfsan_read_label(timep, sizeof(time_t)), result,
-                    sizeof(struct tm));
+                    sizeof(struct tm), 0);
     *ret_label = result_label;
   } else {
     *ret_label = 0;
@@ -800,11 +800,11 @@ int __dfsw_getpwuid_r(id_t uid, struct passwd *pwd,
   // address of pwd in *result.  On failure, NULL is stored in *result.
   int ret = getpwuid_r(uid, pwd, buf, buflen, result);
   if (ret == 0) {
-    dfsan_set_label(0, pwd, sizeof(struct passwd));
-    dfsan_set_label(0, buf, strlen(buf) + 1);
+    dfsan_set_label(0, pwd, sizeof(struct passwd), 0);
+    dfsan_set_label(0, buf, strlen(buf) + 1, 0);
   }
   *ret_label = 0;
-  dfsan_set_label(0, result, sizeof(struct passwd*));
+  dfsan_set_label(0, result, sizeof(struct passwd*), 0);
   return ret;
 }
 
@@ -832,15 +832,15 @@ int __dfsw_select(int nfds, fd_set *readfds, fd_set *writefds,
   // Clear everything (also on error) since their content is either set or
   // undefined.
   if (readfds) {
-    dfsan_set_label(0, readfds, sizeof(fd_set));
+    dfsan_set_label(0, readfds, sizeof(fd_set), 0);
   }
   if (writefds) {
-    dfsan_set_label(0, writefds, sizeof(fd_set));
+    dfsan_set_label(0, writefds, sizeof(fd_set), 0);
   }
   if (exceptfds) {
-    dfsan_set_label(0, exceptfds, sizeof(fd_set));
+    dfsan_set_label(0, exceptfds, sizeof(fd_set), 0);
   }
-  dfsan_set_label(0, timeout, sizeof(struct timeval));
+  dfsan_set_label(0, timeout, sizeof(struct timeval), 0);
   *ret_label = 0;
   return ret;
 }
@@ -852,7 +852,7 @@ int __dfsw_sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask,
                              dfsan_label mask_label, dfsan_label *ret_label) {
   int ret = sched_getaffinity(pid, cpusetsize, mask);
   if (ret == 0) {
-    dfsan_set_label(0, mask, cpusetsize);
+    dfsan_set_label(0, mask, cpusetsize, 0);
   }
   *ret_label = 0;
   return ret;
@@ -862,7 +862,7 @@ SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_sigemptyset(sigset_t *set, dfsan_label set_label,
                        dfsan_label *ret_label) {
   int ret = sigemptyset(set);
-  dfsan_set_label(0, set, sizeof(sigset_t));
+  dfsan_set_label(0, set, sizeof(sigset_t), 0);
   *ret_label = 0;
   return ret;
 }
@@ -874,7 +874,7 @@ int __dfsw_sigaction(int signum, const struct sigaction *act,
                      dfsan_label *ret_label) {
   int ret = sigaction(signum, act, oldact);
   if (oldact) {
-    dfsan_set_label(0, oldact, sizeof(struct sigaction));
+    dfsan_set_label(0, oldact, sizeof(struct sigaction), 0);
   }
   *ret_label = 0;
   return ret;
@@ -886,10 +886,10 @@ int __dfsw_gettimeofday(struct timeval *tv, struct timezone *tz,
                         dfsan_label *ret_label) {
   int ret = gettimeofday(tv, tz);
   if (tv) {
-    dfsan_set_label(0, tv, sizeof(struct timeval));
+    dfsan_set_label(0, tv, sizeof(struct timeval), 0);
   }
   if (tz) {
-    dfsan_set_label(0, tz, sizeof(struct timezone));
+    dfsan_set_label(0, tz, sizeof(struct timezone), 0);
   }
   *ret_label = 0;
   return ret;
@@ -963,7 +963,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_nanosleep(const struct timespec *req,
   *ret_label = 0;
   if (ret == -1) {
     // Interrupted by a signal, rem is filled with the remaining time.
-    dfsan_set_label(0, rem, sizeof(struct timespec));
+    dfsan_set_label(0, rem, sizeof(struct timespec), 0);
   }
   return ret;
 }
@@ -976,7 +976,7 @@ __dfsw_socketpair(int domain, int type, int protocol, int sv[2],
   int ret = socketpair(domain, type, protocol, sv);
   *ret_label = 0;
   if (ret == 0) {
-    dfsan_set_label(0, sv, sizeof(*sv) * 2);
+    dfsan_set_label(0, sv, sizeof(*sv) * 2, 0);
   }
   return ret;
 }
@@ -1217,7 +1217,7 @@ static int format_buffer(char *str, size_t size, const char *fmt,
           int *ptr = va_arg(ap, int *);
           *ptr = (int)formatter.str_off;
           va_labels++;
-          dfsan_set_label(0, ptr, sizeof(ptr));
+          dfsan_set_label(0, ptr, sizeof(ptr), 0);
           end_fmt = true;
           break;
         }
@@ -1410,7 +1410,7 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
       // }
       // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
     } else {
-      dfsan_set_label(0, ptr, ret * size);
+      dfsan_set_label(0, ptr, ret * size, 0);
     }
   }
   return ret;
@@ -1594,7 +1594,7 @@ char *__dfsw_fgets(char *s, int size, FILE *stream, dfsan_label s_label,
       // including terminating \0
       for (size_t i = 0; i < strlen(ret); i++) {
         char *buf = s + i;
-        dfsan_set_label(get_label_for(fd, offset + i), buf, 1);
+        dfsan_set_label(get_label_for(fd, offset + i), buf, 1, 0);
       }
       dfsan_set_label(0, s + strlen(ret), 1, 0);
       // for(int i = strlen(ret) + 1; i < size; i++) {
@@ -1911,7 +1911,7 @@ int __dfsw_posix_memalign(void **memptr, size_t alignment, size_t size,
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(*memptr) * 8,
           (u64)(*memptr), (u64)(*memptr) + size, pc);
-      dfsan_set_label(bound, memptr, sizeof(*memptr));
+      dfsan_set_label(bound, memptr, sizeof(*memptr), pc);
       AOUT("length: %lld = %d, addr: %p = %d\n", size, size_label, *memptr, *ret_label);
     }
   }
@@ -2141,7 +2141,7 @@ __dfsw_mmap(void *start, size_t length, int prot, int flags, int fd,
       for (size_t i = tainted_length; i < length; i++)
         dfsan_set_label(-1, (char *)ret + i, 1, 0);
     } else {
-      dfsan_set_label(0, ret, length);
+      dfsan_set_label(0, ret, length, 0);
     }
   }
   *ret_label = 0;
@@ -2154,7 +2154,7 @@ __dfsw_munmap(void *addr, size_t length, dfsan_label addr_label,
   // clear sth
   AOUT("munmap, addr %p, length %lld \n", addr, length);
   int ret = munmap(addr, length);
-  if (!ret) dfsan_set_label(0, addr, length);
+  if (!ret) dfsan_set_label(0, addr, length, 0);
   *ret_label = 0;
   return ret;
 }

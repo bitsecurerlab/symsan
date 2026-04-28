@@ -17,6 +17,7 @@
 #include "dfsan.h"
 #include "interception/interception.h"
 #include "sanitizer_common/sanitizer_common.h"
+#include "sanitizer_common/sanitizer_posix.h"
 
 using namespace __sanitizer;
 
@@ -36,34 +37,16 @@ void ReleaseShadowMemoryPagesToOS(void *addr, SIZE_T length) {
 
 INTERCEPTOR(void *, mmap, void *addr, SIZE_T length, int prot, int flags,
             int fd, OFF_T offset) {
-  void *res = nullptr;
-  
-  // interceptors_initialized is set to true during preinit_array, when we're
-  // single-threaded.  So we don't need to worry about accessing it atomically.
-  if (!interceptors_initialized)
-    res = (void *)syscall(__NR_mmap, addr, length, prot, flags, fd, offset);
-  else
-    res = REAL(mmap)(addr, length, prot, flags, fd, offset);
-
-  if (res != (void*)-1)
-    ReleaseShadowMemoryPagesToOS(res, length);
-  return res;
+  return (void *)internal_mmap(addr, length, prot, flags, fd, offset);
 }
 
 INTERCEPTOR(void *, mmap64, void *addr, SIZE_T length, int prot, int flags,
             int fd, OFF64_T offset) {
-  void *res = REAL(mmap64)(addr, length, prot, flags, fd, offset);
-  if (res != (void*)-1)
-    ReleaseShadowMemoryPagesToOS(res, length);
-  return res;
+  return (void *)internal_mmap(addr, length, prot, flags, fd, offset);
 }
 
 INTERCEPTOR(int, munmap, void *addr, SIZE_T length) {
-  int res = REAL(munmap)(addr, length);
-  if (res != -1) {
-    ReleaseShadowMemoryPagesToOS(addr, length);
-  }
-  return res;
+  return (int)internal_munmap(addr, length);
 }
 
 namespace __dfsan {
